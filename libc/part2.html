@@ -1,0 +1,1560 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libc 깊이 — Part II: libc 의 정체</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle">🌙 Dark</button>
+<div class="layout">
+<aside class="sidebar"><nav class="toc" aria-label="목차"><div class="sidebar-section sidebar-home"><a href="../index.html" class="home-link">← System Internals 홈</a></div><div class="sidebar-section"><div class="toc-title">Parts</div><ul class="part-nav-list"><li><a href="part1.html" class="part-nav-link"><span class="part-nav-num">Part I</span><span class="part-nav-text">기초</span></a></li><li><a href="part2.html" class="part-nav-link part-nav-current"><span class="part-nav-num">Part II</span><span class="part-nav-text">libc 의 정체</span></a></li><li><a href="part3.html" class="part-nav-link"><span class="part-nav-num">Part III</span><span class="part-nav-text">_start 부터 main 까지</span></a></li><li><a href="part4.html" class="part-nav-link"><span class="part-nav-num">Part IV</span><span class="part-nav-text">malloc 의 깊이</span></a></li><li><a href="part5.html" class="part-nav-link"><span class="part-nav-num">Part V</span><span class="part-nav-text">stdio 의 깊이</span></a></li><li><a href="part6.html" class="part-nav-link"><span class="part-nav-num">Part VI</span><span class="part-nav-text">pthread 의 깊이</span></a></li><li><a href="part7.html" class="part-nav-link"><span class="part-nav-num">Part VII</span><span class="part-nav-text">dynamic linker</span></a></li></ul></div><div class="sidebar-section"><div class="toc-title">Contents</div><ul class="toc-list"><li class="toc-sec"><a href="#9-libc-의-3-영역-개관"><span class="toc-num">9</span><span class="toc-label">libc 의 3 영역 개관</span></a></li><li class="toc-sec"><a href="#10-syscall-wrapper-의-실제-glibc-musl-비교"><span class="toc-num">10</span><span class="toc-label">syscall wrapper 의 실제</span></a></li><li class="toc-sec"><a href="#11-추상화-층의-정체"><span class="toc-num">11</span><span class="toc-label">추상화 층의 정체</span></a></li><li class="toc-sec"><a href="#12-순수-user-space-함수"><span class="toc-num">12</span><span class="toc-label">순수 user-space 함수</span></a></li><li class="toc-sec"><a href="#13-simd-가속된-libc-함수"><span class="toc-num">13</span><span class="toc-label">SIMD 가속된 libc 함수</span></a></li></ul></div></nav></aside>
+<main class="content">
+<nav class="part-nav part-nav-top"><a href="part1.html" class="nav-link nav-prev" rel="prev"><span class="nav-arrow">←</span><span class="nav-meta"><span class="nav-label">Part I</span><span class="nav-title">기초</span></span></a><a href="index.html" class="nav-hub">libc 허브</a><a href="part3.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part III</span><span class="nav-title">_start 부터 main 까지</span></span><span class="nav-arrow">→</span></a></nav>
+<div class="doc-header"><div class="doc-eyebrow">libc internals</div><h1 class="doc-title">Part II — libc 의 정체</h1><div class="doc-subtitle">세 가지 일</div><div class="doc-meta"><span>9~13장</span><span>5 chapters</span><span>Verified against glibc master</span></div></div>
+<h1 class="stage-heading" id="part-ii-libc-의-정체-세-가지-일"><span class="stage-label">Part II</span><span class="stage-title">libc 의 정체 — 세 가지 일</span></h1>
+<p>Part I 에서 user-space 와 kernel-space 의 경계를 보았다. 이제 그 경계 위에 서 있는 libc 자체가 무엇을 하는지 본다.</p>
+<p>이 Part 의 핵심 주장은 — <strong>libc 는 syscall wrapper 의 모음이 아니다</strong>. Part I 의 1장에서 잠시 보았듯 libc 가 하는 일은 크게 세 가지로 나뉘는데, <strong>그 중 syscall wrapper 는 전체의 1/3 도 되지 않는다</strong>. 나머지 2/3 가 — 추상화 층과 순수 user-space 함수 — 가 libc 의 진짜 가치를 만든다.</p>
+<p>각 영역을 차례로 깊이 본다. master 의 실제 코드를 인용해 가며 — glibc 와 musl 의 차이도 비교한다.</p>
+<h2 class="section-heading" id="9-libc-의-3-영역-개관"><span class="section-num">9</span><span class="section-title">libc 의 3 영역 개관</span></h2>
+<p>libc 가 제공하는 함수들을 분류하면 다음 세 가지 영역으로 나뉜다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────────┐
+│ libc 의 3 영역                                                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  (a) syscall wrapper                                              │
+│      kernel 의 syscall 을 C 함수로 감싼 얇은 함수                    │
+│      한 syscall = 한 wrapper 가 일반적                              │
+│      예: read, write, open, close, fork, ...                     │
+│                                                                  │
+│  (b) 추상화 층                                                     │
+│      여러 syscall 의 조합 + 상태 관리 + buffer + caching            │
+│      한 호출이 0~여러 번의 syscall 을 일으킬 수 있음                  │
+│      예: malloc, free, printf, fopen, pthread_create, ...        │
+│                                                                  │
+│  (c) 순수 user-space 함수                                          │
+│      kernel 을 한 번도 호출하지 않는 함수                            │
+│      CPU 안에서 메모리 연산/산술만 수행                              │
+│      예: strcpy, strlen, memcpy, sin, cos, qsort, ...            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+<h3 id="각-영역의-호출-흐름-본질적-차이">각 영역의 호출 흐름 — 본질적 차이</h3>
+<p>세 영역이 syscall 과 어떤 관계인지를 도식으로 보면 차이가 명료해진다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────────────────────────────────────────────────────┐
+│ (a) syscall wrapper — kernel 진입 1번                              │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   user code                                                       │
+│      │                                                            │
+│      │  read(fd, buf, n)                                          │
+│      ▼                                                            │
+│   ┌──────────────────────────┐                                    │
+│   │ glibc read()             │                                    │
+│   │  - 인자 정리               │                                    │
+│   │  - syscall 명령어          │                                    │
+│   │  - errno 처리             │                                    │
+│   └─────────┬────────────────┘                                    │
+│             │                                                     │
+│  ═══════════╪══════════════════ user/kernel 경계                    │
+│             ▼                                                     │
+│   ╔══════════════════════════╗                                    │
+│   ║ kernel sys_read           ║                                    │
+│   ╚══════════════════════════╝                                    │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ (b) 추상화 층 — 여러 syscall 또는 buffer 위에서 0~여러 번 호출         │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   user code                                                       │
+│      │                                                            │
+│      │  printf(&quot;hello %d\n&quot;, x)                                   │
+│      ▼                                                            │
+│   ┌──────────────────────────┐                                    │
+│   │ glibc vfprintf           │                                    │
+│   │  - format string 파싱     │                                    │
+│   │  - %d 를 문자열로 변환      │                                    │
+│   │  - stdio buffer 에 누적   │  ← 보통 여기서 끝남 (syscall 없이)    │
+│   │  - buffer 가 차면         │                                    │
+│   │    또는 \n 만나면          │                                    │
+│   │    flush 호출             │                                    │
+│   └─────────┬────────────────┘                                    │
+│             │  (buffer flush 시에만)                                │
+│  ═══════════╪══════════════════ user/kernel 경계                    │
+│             ▼                                                     │
+│   ╔══════════════════════════╗                                    │
+│   ║ kernel sys_write          ║                                    │
+│   ╚══════════════════════════╝                                    │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ (c) 순수 user-space — kernel 진입 없음                              │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   user code                                                       │
+│      │                                                            │
+│      │  strlen(s)                                                 │
+│      ▼                                                            │
+│   ┌──────────────────────────┐                                    │
+│   │ glibc strlen             │                                    │
+│   │  - byte 단위 또는 SIMD     │                                    │
+│   │    로 메모리 스캔           │                                    │
+│   │  - &#x27;\0&#x27; 위치 찾기         │                                    │
+│   │  - 거리 반환                │                                    │
+│   └─────────┬────────────────┘                                    │
+│             │                                                     │
+│             ▼ (반환, kernel 진입 없음)                                │
+│   user code 가 결과 받음                                            │
+│                                                                   │
+│  ═══════════ user/kernel 경계 (넘지 않음) ═══════════                 │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘</code></pre>
+<h3 id="영역별-코드-라인-비율">영역별 코드 라인 비율</h3>
+<p>glibc 의 실제 master 소스를 보면 — 디렉토리 구조 자체가 이 세 영역의 비율을 잘 보여준다.</p>
+<pre class="code-block lang-text"><code>[glibc master 의 주요 디렉토리 구조]
+
+  glibc/
+  ├── sysdeps/             ← syscall wrapper + 아키텍처별 코드
+  │   └── unix/sysv/linux/  → Linux syscall wrapper 들
+  │
+  ├── stdio-common/        ← (b) 추상화 — stdio 의 일부
+  ├── stdio/               ← (b) 추상화 — stdio
+  ├── malloc/              ← (b) 추상화 — malloc
+  ├── nptl/                ← (b) 추상화 — pthread
+  ├── elf/                 ← (b) 추상화 — dynamic linker
+  ├── resolv/              ← (b) 추상화 — DNS 해석
+  ├── locale/              ← (b) 추상화 — locale
+  │
+  ├── string/              ← (c) 순수 — strcpy, memcpy, ...
+  ├── math/                ← (c) 순수 — sin, cos, sqrt, ...
+  ├── stdlib/              ← (c) 순수 — qsort, bsearch, atoi, ...
+  ├── ctype/               ← (c) 순수 — isalpha, tolower, ...
+  ├── time/                ← 혼합 — gettimeofday 는 (a), strftime 은 (c)
+  └── wctype/, wcsmbs/     ← (c) 순수 — wide char 처리</code></pre>
+<p>실제로 라인 수를 세어 보면 (master 기준):</p>
+<pre class="code-block lang-text"><code>[glibc 코드 라인 비율 (대략)]
+
+  syscall wrapper (sysdeps/unix/sysv/linux 등):     ~ 15-20%
+  추상화 층 (malloc, stdio, nptl, elf, 등):          ~ 35-40%
+  순수 user-space (string, math, stdlib, 등):       ~ 30-35%
+  나머지 (locale, iconv, debug 등):                  ~ 10-15%</code></pre>
+<p>대부분 사람의 인상과 달리 — <strong>syscall wrapper 는 가장 작은 영역</strong>이다. libc 의 진짜 가치는 그 위에 쌓인 추상화 층과, kernel 과 무관한 순수 user-space 함수들에 있다.</p>
+<h3 id="영역-판별의-기준-syscall-횟수">영역 판별의 기준 — &quot;syscall 횟수&quot;</h3>
+<p>세 영역을 명료히 구분하는 기준은 — <strong>한 호출이 일으키는 syscall 의 횟수</strong>다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────────────────────────────────────────────────┐
+│ 호출당 syscall 횟수로 본 영역 분류                              │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  영역 (a) syscall wrapper                                      │
+│    호출 1번 = syscall 1번 (보통)                                 │
+│    예외: 인자 변환이나 EINTR retry 가 있을 때 0~2 번             │
+│                                                               │
+│  영역 (b) 추상화 층                                              │
+│    호출 1번 = syscall 0번 ~ 수십 번                              │
+│    상황에 따라 다름                                              │
+│    예: malloc — 보통 0 번, 가끔 1 번 (brk/mmap)                  │
+│       printf — 보통 0 번, buffer full 시 1 번                  │
+│       getaddrinfo — 5~20 번 (여러 syscall 조합)                 │
+│       pthread_create — 1~5 번 (clone + 보조 syscall)            │
+│                                                               │
+│  영역 (c) 순수 user-space                                       │
+│    호출 1번 = syscall 0번 (항상)                                 │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+<p>이 분류가 흥미로운 이유는 — <strong>응용 프로그램의 성능 분석에 직접 영향</strong>을 준다.</p>
+<pre class="code-block lang-text"><code>[성능 분석 시사점]
+
+영역 (a) 함수가 핫스팟이면 → kernel 진입 비용이 큼 → 호출 줄이거나 batch
+영역 (b) 함수가 핫스팟이면 → 분석 필요 (buffer 효과인가, 호출 횟수인가)
+영역 (c) 함수가 핫스팟이면 → CPU 연산 자체가 비싼 것 → 알고리즘/SIMD 검토</code></pre>
+<p><code class="inline-code">strace</code> 로 syscall 을 보면 영역 (a) 와 영역 (b) 의 효과는 보이지만, 영역 (c) 는 보이지 않는다. <code class="inline-code">perf</code> 같은 CPU 프로파일러로만 영역 (c) 를 본다.</p>
+<h3 id="함수가-어느-영역인지-빠르게-판별하는-법">함수가 어느 영역인지 빠르게 판별하는 법</h3>
+<p>man page 의 section 번호가 첫 단서다.</p>
+<pre class="code-block lang-text"><code>[man section 으로 보는 영역 판별]
+
+man 2  →  System call (= kernel 함수)
+          → 그 이름의 libc 함수는 보통 영역 (a) wrapper
+          
+man 3  →  Library function (= libc 의 user-space 함수)
+          → 영역 (b) 또는 (c)
+          → 더 세분화는 함수의 본체를 봐야 함</code></pre>
+<pre class="code-block lang-bash"><code><span class="hl-co"># [user-space - bash]</span>
+<span class="hl-co">$</span> <span class="hl-fn">man</span> -k read | <span class="hl-fn">grep</span> <span class="hl-str">&quot;(2)&quot;</span>        <span class="hl-co"># syscall 인 것들</span>
+<span class="hl-fn">read</span> (<span class="hl-num">2</span>)              - read from a file descriptor
+<span class="hl-fn">readv</span> (<span class="hl-num">2</span>)             - read or write data into multiple buffers
+<span class="hl-fn">...</span>
+
+<span class="hl-co">$</span> <span class="hl-fn">man</span> -k read | <span class="hl-fn">grep</span> <span class="hl-str">&quot;(3)&quot;</span>        <span class="hl-co"># 라이브러리 함수인 것들</span>
+<span class="hl-fn">fread</span> (<span class="hl-num">3</span>)             - binary stream input/output
+<span class="hl-fn">readdir</span> (<span class="hl-num">3</span>)           - read a directory
+<span class="hl-fn">...</span></code></pre>
+<p><code class="inline-code">fread</code> 가 section 3 이라는 사실이 결정적이다 — 그건 kernel 함수가 아니라 glibc 의 추상화 함수 (<code class="inline-code">read</code> syscall 위에 buffer 를 얹은 것) 라는 뜻이다.</p>
+<pre class="code-block lang-text"><code>[man 2 vs man 3 의 의미]
+
+  read   (man 2)  →  glibc 의 read() = kernel sys_read 의 wrapper
+                     → 영역 (a)
+                     → man 2 가 kernel ABI 문서
+                     
+  fread  (man 3)  →  glibc 의 fread() = stdio buffer 위의 함수
+                     → 영역 (b)
+                     → man 3 가 libc API 문서
+                     → 내부에서 read() 호출 (또는 buffer 사용)</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>libc 는 단일한 무언가가 아니다. 세 영역의 함수들이 한 라이브러리 안에 모여 있을 뿐이다. 각 영역은:</p>
+<ul><li><strong>목적이 다르다</strong> — wrapper, 추상화, 순수 연산</li><li><strong>kernel 과의 관계가 다르다</strong> — 1번, 0~여러 번, 0번</li><li><strong>성능 특성이 다르다</strong> — kernel 진입 비용, buffer 효과, CPU 연산</li><li><strong>출처가 다르다</strong> — kernel ABI, libc API, ISO C/POSIX 표준 함수</li></ul>
+<p>이 다음 4 개의 장에서 — 각 영역의 본체를 master 의 실제 코드를 보면서 깊이 분석한다. 다음 장은 영역 (a) syscall wrapper 의 실제다.</p>
+<h2 class="section-heading" id="10-syscall-wrapper-의-실제-glibc-musl-비교"><span class="section-num">10</span><span class="section-title">syscall wrapper 의 실제 — glibc / musl 비교</span></h2>
+<p>이 장은 libc 의 영역 (a) — syscall wrapper — 의 본체를 본다. glibc 와 musl 두 구현체의 master 소스를 직접 인용하면서 — 그 디자인 철학의 차이도 함께 본다.</p>
+<h3 id="musl-의-write-가장-단순한-형태">musl 의 write() — 가장 단순한 형태</h3>
+<p>먼저 musl 부터 본다. musl 의 철학은 &quot;단순함과 표준 준수&quot; 다. <code class="inline-code">src/unistd/write.c</code> 의 본체는 단 7 줄.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - musl src/unistd/write.c master]</span>
+#include &lt;unistd.h&gt;
+#include <span class="hl-str">&quot;syscall.h&quot;</span>
+
+<span class="hl-kw">ssize_t</span> <span class="hl-fn">write</span>(<span class="hl-kw">int</span> fd, <span class="hl-kw">const</span> <span class="hl-kw">void</span> *buf, <span class="hl-kw">size_t</span> count)
+{
+    <span class="hl-kw">return</span> <span class="hl-fn">syscall_cp</span>(SYS_write, fd, buf, count);
+}</code></pre>
+<p>이게 전부다. <code class="inline-code">syscall_cp</code> 매크로 한 줄로 syscall 호출하고 반환. cancellation point 지원이 <code class="inline-code">_cp</code> 접미사로 표시되어 있다.</p>
+<p><code class="inline-code">syscall_cp</code> 매크로는 — <code class="inline-code">__syscall_cp</code> 라는 어셈블리 함수를 호출하는 wrapper 다. 그 본체는 아키텍처별로 <code class="inline-code">src/internal/&lt;arch&gt;/syscall_cp.s</code> 에 있다 (x86_64):</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - musl src/thread/x86_64/syscall_cp.s master]</span>
+<span class="hl-kw">.global</span> __syscall_cp_asm
+.hidden __syscall_cp_asm
+<span class="hl-kw">.type</span>   __syscall_cp_asm,@function
+<span class="hl-fn">__syscall_cp_asm</span>:
+<span class="hl-fn">__cp_begin</span>:
+    <span class="hl-kw">mov</span> (<span class="hl-kw">%rdi</span>), <span class="hl-kw">%eax</span>        <span class="hl-co">; cancel flag 체크 (rdi = pointer to cancel state)</span>
+    <span class="hl-kw">test</span> <span class="hl-kw">%eax</span>, <span class="hl-kw">%eax</span>
+    <span class="hl-kw">jnz</span> __cp_cancel         <span class="hl-co">; cancel 요청되었으면 cancel 처리</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%rdi</span>, <span class="hl-kw">%r11</span>          <span class="hl-co">; r11 에 cancel pointer 보관</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%rsi</span>, <span class="hl-kw">%rax</span>          <span class="hl-co">; syscall 번호 (2nd arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%rdx</span>, <span class="hl-kw">%rdi</span>          <span class="hl-co">; 3rd arg → rdi (1st syscall arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%rcx</span>, <span class="hl-kw">%rsi</span>          <span class="hl-co">; 4th arg → rsi (2nd syscall arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%r8</span>,  <span class="hl-kw">%rdx</span>          <span class="hl-co">; 5th arg → rdx (3rd syscall arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%r9</span>,  <span class="hl-kw">%r10</span>          <span class="hl-co">; 6th arg → r10 (4th syscall arg, rcx 우회)</span>
+    <span class="hl-kw">mov</span> <span class="hl-num">8</span>(<span class="hl-kw">%rsp</span>), <span class="hl-kw">%r8</span>        <span class="hl-co">; stack 의 7th arg → r8 (5th syscall arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-num">16</span>(<span class="hl-kw">%rsp</span>), <span class="hl-kw">%r9</span>       <span class="hl-co">; stack 의 8th arg → r9 (6th syscall arg)</span>
+    <span class="hl-kw">mov</span> <span class="hl-kw">%r11</span>, <span class="hl-num">8</span>(<span class="hl-kw">%rsp</span>)       <span class="hl-co">; r11 (cancel ptr) 을 stack 에 복원</span>
+    <span class="hl-kw">syscall</span>                  <span class="hl-co">; ← user/kernel 전환</span>
+<span class="hl-fn">__cp_end</span>:
+    <span class="hl-kw">ret</span>
+<span class="hl-fn">__cp_cancel</span>:
+    <span class="hl-kw">jmp</span> __cancel</code></pre>
+<p>핵심은 — <strong>인자 register 재배치 + r10 변환 + syscall 명령어</strong>. Part I 의 5장에서 본 그 그대로다. cancel 처리가 추가되어 있을 뿐.</p>
+<p><code class="inline-code">__syscall_cp_asm</code> 의 인자 배치가 특이한데 — 첫 인자 (rdi) 가 syscall 번호가 아니라 <strong>cancel 상태 pointer</strong> 다. 두 번째 인자 (rsi) 가 syscall 번호. 이건 cancel handling 위한 디자인이다 — 시스템 호출 전에 thread 의 cancel flag 를 확인하고, 호출 중 cancel 이 발생하면 <code class="inline-code">__cancel</code> 로 점프.</p>
+<p>cancel 처리가 필요 없는 syscall 은 더 단순한 <code class="inline-code">__syscall</code> 을 쓴다. musl 의 <code class="inline-code">src/internal/x86_64/syscall.s</code>:</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - musl src/internal/x86_64/syscall.s master]</span>
+<span class="hl-kw">.global</span> __syscall
+.hidden __syscall
+<span class="hl-kw">.type</span> __syscall,@function
+<span class="hl-fn">__syscall</span>:
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rdi</span>, <span class="hl-kw">%rax</span>              <span class="hl-co">; syscall 번호</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rsi</span>, <span class="hl-kw">%rdi</span>              <span class="hl-co">; arg1</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rdx</span>, <span class="hl-kw">%rsi</span>              <span class="hl-co">; arg2</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rcx</span>, <span class="hl-kw">%rdx</span>              <span class="hl-co">; arg3</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%r8</span>,  <span class="hl-kw">%r10</span>              <span class="hl-co">; arg4 (rcx → r10 으로!)</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%r9</span>,  <span class="hl-kw">%r8</span>               <span class="hl-co">; arg5</span>
+    <span class="hl-kw">movq</span> <span class="hl-num">8</span>(<span class="hl-kw">%rsp</span>), <span class="hl-kw">%r9</span>            <span class="hl-co">; arg6 (stack 에서)</span>
+    <span class="hl-kw">syscall</span>                       <span class="hl-co">; ← kernel 진입</span>
+    <span class="hl-kw">ret</span>                           <span class="hl-co">; 반환 (rax 그대로)</span></code></pre>
+<p>10 줄짜리 어셈블리. musl 의 디자인이 얼마나 단순한지 보여준다.</p>
+<h3 id="glibc-의-write-더-복잡한-구조">glibc 의 write() — 더 복잡한 구조</h3>
+<p>glibc 의 <code class="inline-code">sysdeps/unix/sysv/linux/write.c</code> 도 본체는 비슷하지만 매크로의 깊이가 훨씬 많다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/unix/sysv/linux/write.c master]</span>
+#include &lt;unistd.h&gt;
+#include &lt;sysdep-cancel.h&gt;
+
+<span class="hl-co">/* Write NBYTES of BUF to FD.  Return the number written, or -1.  */</span>
+<span class="hl-kw">ssize_t</span> <span class="hl-fn">__libc_write</span> (<span class="hl-kw">int</span> fd, <span class="hl-kw">const</span> <span class="hl-kw">void</span> *buf, <span class="hl-kw">size_t</span> nbytes)
+{
+    <span class="hl-kw">return</span> <span class="hl-fn">SYSCALL_CANCEL</span> (write, fd, buf, nbytes);
+}
+<span class="hl-fn">libc_hidden_def</span> (__libc_write)
+
+<span class="hl-fn">weak_alias</span> (__libc_write, __write)
+<span class="hl-fn">libc_hidden_weak</span> (__write)
+<span class="hl-fn">weak_alias</span> (__libc_write, write)
+<span class="hl-fn">libc_hidden_weak</span> (write)</code></pre>
+<p>세 개의 심볼이 정의된다 — <code class="inline-code">__libc_write</code>, <code class="inline-code">__write</code>, <code class="inline-code">write</code>. 그러나 함수 본체는 <strong>하나</strong> (<code class="inline-code">__libc_write</code>) 다. <code class="inline-code">__write</code> 와 <code class="inline-code">write</code> 는 <code class="inline-code">weak_alias</code> 매크로로 만들어진 같은 함수의 <strong>다른 이름</strong>이다 — 별개 함수가 아니라 단일 심볼의 여러 이름. 왜 이렇게 많은 별칭이 필요한가?</p>
+<pre class="code-block lang-text"><code>[glibc 의 다중 별칭 패턴]
+
+  write              → application 이 부르는 표준 이름
+                     → weak alias, 사용자가 redefine 가능
+                     
+  __write            → glibc 내부에서 부르는 이름
+                     → 사용자가 write 를 redefine 해도 영향 안 받음
+                     
+  __libc_write       → 더 내부적인 이름
+                     → 일부 시스템에서 cancel point 우회용</code></pre>
+<p>이 다중 별칭은 — <strong>glibc 의 ABI 안정성과 사용자 코드의 자유</strong>를 동시에 보장하기 위한 디자인이다. 사용자가 <code class="inline-code">write</code> 를 자기 함수로 정의해서 LD_PRELOAD 로 가로채도 — glibc 내부는 <code class="inline-code">__write</code> 를 쓰므로 영향이 없다.</p>
+<p><code class="inline-code">SYSCALL_CANCEL</code> 매크로의 전개를 따라가면 결국 <code class="inline-code">INLINE_SYSCALL</code> 또는 <code class="inline-code">INTERNAL_SYSCALL</code> 에 도달한다. master 의 <code class="inline-code">sysdeps/unix/sysv/linux/sysdep.h</code>:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdep.h master 단순화]</span>
+#define <span class="hl-fn">INLINE_SYSCALL</span>(name, nr, args...)                       \
+    ({                                                          \
+        <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> resultvar = <span class="hl-fn">INTERNAL_SYSCALL</span> (name, , nr, args); \
+        <span class="hl-kw">if</span> (<span class="hl-fn">__glibc_unlikely</span> (<span class="hl-fn">INTERNAL_SYSCALL_ERROR_P</span> (resultvar, ))) \
+        {                                                       \
+            <span class="hl-fn">__set_errno</span> (<span class="hl-fn">INTERNAL_SYSCALL_ERRNO</span> (resultvar, )); \
+            resultvar = (<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span>) -<span class="hl-num">1</span>;                 \
+        }                                                       \
+        (<span class="hl-kw">long</span> <span class="hl-kw">int</span>) resultvar;                                   \
+    })</code></pre>
+<p>이 매크로가 — Part I 5장의 &quot;libc wrapper 가 하는 일&quot; 다섯 단계를 정확히 수행한다.</p>
+<pre class="code-block lang-text"><code>[INLINE_SYSCALL 매크로의 실제 일]
+
+1. INTERNAL_SYSCALL (name, ...) 
+   → syscall 명령어 실행, 결과를 resultvar 에 저장
+
+2. INTERNAL_SYSCALL_ERROR_P (resultvar, )
+   → -4095 ~ -1 범위인지 검사
+
+3. 에러면 __set_errno()
+   → __errno_location() 의 위치에 -resultvar 저장
+   
+4. 에러면 resultvar = -1
+   → 사용자에게 표준 에러 반환값 -1
+
+5. (long int) resultvar 반환</code></pre>
+<h3 id="아키텍처별-internal_syscall-x86_64">아키텍처별 INTERNAL_SYSCALL — x86_64</h3>
+<p><code class="inline-code">INTERNAL_SYSCALL</code> 의 아키텍처별 구현이 syscall 명령어를 호출하는 곳이다. master 의 <code class="inline-code">sysdeps/unix/sysv/linux/x86_64/sysdep.h</code> :</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc x86_64 sysdep.h master 단순화]</span>
+#define <span class="hl-fn">INTERNAL_SYSCALL</span>(name, err, nr, args...)                \
+    internal_syscall##<span class="hl-fn">nr</span> (<span class="hl-fn">SYS_ify</span> (name), err, args)
+
+#define <span class="hl-fn">internal_syscall3</span>(number, err, arg1, arg2, arg3)        \
+    ({                                                          \
+        <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> resultvar;                            \
+        <span class="hl-fn">TYPEFY</span> (arg3, __arg3) = <span class="hl-fn">ARGIFY</span> (arg3);                  \
+        <span class="hl-fn">TYPEFY</span> (arg2, __arg2) = <span class="hl-fn">ARGIFY</span> (arg2);                  \
+        <span class="hl-fn">TYPEFY</span> (arg1, __arg1) = <span class="hl-fn">ARGIFY</span> (arg1);                  \
+        <span class="hl-kw">register</span> <span class="hl-fn">TYPEFY</span> (arg3, _a3) <span class="hl-kw">asm</span> (<span class="hl-str">&quot;rdx&quot;</span>) = __arg3;       \
+        <span class="hl-kw">register</span> <span class="hl-fn">TYPEFY</span> (arg2, _a2) <span class="hl-kw">asm</span> (<span class="hl-str">&quot;rsi&quot;</span>) = __arg2;       \
+        <span class="hl-kw">register</span> <span class="hl-fn">TYPEFY</span> (arg1, _a1) <span class="hl-kw">asm</span> (<span class="hl-str">&quot;rdi&quot;</span>) = __arg1;       \
+        <span class="hl-kw">asm</span> <span class="hl-kw">volatile</span> (                                          \
+            <span class="hl-str">&quot;syscall\n\t&quot;</span>                                       \
+            : <span class="hl-str">&quot;=a&quot;</span> (resultvar)                                  \
+            : <span class="hl-str">&quot;0&quot;</span> (number), <span class="hl-str">&quot;r&quot;</span> (_a1), <span class="hl-str">&quot;r&quot;</span> (_a2), <span class="hl-str">&quot;r&quot;</span> (_a3)     \
+            : <span class="hl-str">&quot;memory&quot;</span>, REGISTERS_CLOBBERED_BY_SYSCALL);        \
+        (<span class="hl-kw">long</span> <span class="hl-kw">int</span>) resultvar;                                   \
+    })</code></pre>
+<p>핵심을 본다.</p>
+<pre class="code-block lang-text"><code>[internal_syscall3 의 분해]
+
+input:
+  number = SYS_write 의 번호 (= 1)
+  arg1, arg2, arg3 = fd, buf, count
+
+inline assembly:
+  - rax 에 number 로드 (constraint &quot;0&quot; 가 rax 강제)
+  - rdi 에 arg1 (constraint &quot;r&quot; 와 register 선언)
+  - rsi 에 arg2
+  - rdx 에 arg3
+  - syscall 명령어
+  - rax 의 값을 resultvar 로 (constraint &quot;=a&quot;)
+  - clobber: memory (메모리 변경 가능), rcx, r11 (syscall 이 destroy)</code></pre>
+<p><code class="inline-code">REGISTERS_CLOBBERED_BY_SYSCALL</code> 매크로는 <code class="inline-code">&quot;cc&quot;, &quot;r11&quot;, &quot;cx&quot;</code> 를 포함한다. 이 점이 매우 중요 — Part I 5장에서 본 &quot;syscall 명령어가 rcx, r11 을 destroy&quot; 가 여기 명시되어 있다.</p>
+<h3 id="glibc-의-read-똑같이-본다">glibc 의 read() — 똑같이 본다</h3>
+<p>대조를 위해 read() 도 본다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/unix/sysv/linux/read.c master]</span>
+#include &lt;unistd.h&gt;
+#include &lt;sysdep-cancel.h&gt;
+
+<span class="hl-co">/* Read NBYTES into BUF from FD.  Return the number read or -1.  */</span>
+<span class="hl-kw">ssize_t</span> <span class="hl-fn">__libc_read</span> (<span class="hl-kw">int</span> fd, <span class="hl-kw">void</span> *buf, <span class="hl-kw">size_t</span> nbytes)
+{
+    <span class="hl-kw">return</span> <span class="hl-fn">SYSCALL_CANCEL</span> (read, fd, buf, nbytes);
+}
+<span class="hl-fn">libc_hidden_def</span> (__libc_read)
+
+<span class="hl-fn">libc_hidden_def</span> (__read)
+<span class="hl-fn">weak_alias</span> (__libc_read, __read)
+<span class="hl-fn">libc_hidden_def</span> (read)
+<span class="hl-fn">weak_alias</span> (__libc_read, read)</code></pre>
+<p>write.c 와 거의 동일한 구조. <strong>3 개 인자를 받아 SYS_read 로 syscall 호출</strong> 하는 thin wrapper.</p>
+<h3 id="glibc-의-syscall-임의의-syscall-호출">glibc 의 syscall() — 임의의 syscall 호출</h3>
+<p>특수한 wrapper 가 하나 더 있다 — <code class="inline-code">syscall(2)</code>. 이건 임의의 syscall 번호를 받아서 호출하는 generic 함수다. master 의 <code class="inline-code">sysdeps/unix/sysv/linux/x86_64/syscall.S</code>:</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - glibc syscall.S master 인용]</span>
+<span class="hl-co">; Usage: long syscall (syscall_number, arg1, arg2, arg3, arg4, arg5, arg6)</span>
+<span class="hl-co">; We need to do some arg shifting, the syscall_number will be in rax.</span>
+
+<span class="hl-fn">ENTRY</span> (<span class="hl-kw">syscall</span>)
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rdi</span>, <span class="hl-kw">%rax</span>     <span class="hl-co">; Syscall number -&gt; rax</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rsi</span>, <span class="hl-kw">%rdi</span>     <span class="hl-co">; shift arg1 - arg5</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rdx</span>, <span class="hl-kw">%rsi</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%rcx</span>, <span class="hl-kw">%rdx</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%r8</span>,  <span class="hl-kw">%r10</span>     <span class="hl-co">; arg4: rcx → r10</span>
+    <span class="hl-kw">movq</span> <span class="hl-kw">%r9</span>,  <span class="hl-kw">%r8</span>      <span class="hl-co">; arg5</span>
+    <span class="hl-kw">movq</span> <span class="hl-num">8</span>(<span class="hl-kw">%rsp</span>), <span class="hl-kw">%r9</span>   <span class="hl-co">; arg6 is on the stack</span>
+    <span class="hl-kw">syscall</span>             <span class="hl-co">; Do the system call</span>
+    <span class="hl-kw">cmpq</span> $-<span class="hl-num">4095</span>, <span class="hl-kw">%rax</span>   <span class="hl-co">; Check %rax for error</span>
+    <span class="hl-kw">jae</span> SYSCALL_ERROR_LABEL  <span class="hl-co">; Jump to error handler if error</span>
+    <span class="hl-kw">ret</span>                 <span class="hl-co">; Return to caller</span>
+<span class="hl-fn">PSEUDO_END</span> (<span class="hl-kw">syscall</span>)</code></pre>
+<p>이 코드 한 블록에 Part I 5장 의 모든 핵심 사실이 압축되어 있다.</p>
+<pre class="code-block lang-text"><code>[syscall.S 의 모든 사실]
+
+1. C 함수 호출 ABI 로 인자 도착:
+   rdi = syscall 번호 (1st C arg)
+   rsi, rdx, rcx, r8, r9 = arg1..arg5 (2nd~6th C arg)
+   stack[8] = arg6 (7th C arg)
+
+2. syscall ABI 로 재배치:
+   rdi → rax (syscall 번호)
+   rsi → rdi (arg1)
+   rdx → rsi (arg2)
+   rcx → rdx (arg3)
+   r8  → r10 (arg4, rcx 우회)
+   r9  → r8  (arg5)
+   stack[8] → r9 (arg6)
+
+3. syscall 명령어 실행 (CPU 가 권한 상승)
+
+4. 결과가 rax 에 있음
+   -4095 보다 작으면 ($-4095 와 비교해서 jae = jump if above or equal) 에러
+   → SYSCALL_ERROR_LABEL 로 점프 (errno 설정 + -1 반환)
+   
+5. 정상이면 ret (rax 그대로 반환)</code></pre>
+<p>이 함수가 사용자가 직접 <code class="inline-code">syscall(SYS_write, 1, &quot;hi&quot;, 2)</code> 같은 식으로 호출하는 generic wrapper 다. 개별 wrapper (<code class="inline-code">read</code>, <code class="inline-code">write</code>, ...) 가 없는 새로운 syscall (예: <code class="inline-code">pidfd_open</code>) 을 호출할 때 자주 쓰인다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 사용자가 syscall(2) 를 직접 부르는 예]</span>
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-co">// pidfd_open 의 wrapper 가 없을 수 있음 (libc 가 오래된 경우)</span>
+    <span class="hl-kw">int</span> pidfd = <span class="hl-fn">syscall</span>(SYS_pidfd_open, <span class="hl-num">1234</span>, <span class="hl-num">0</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<h3 id="glibc-의-syscalls-list-자동-생성-메커니즘">glibc 의 syscalls.list — 자동 생성 메커니즘</h3>
+<p>glibc 가 수백 개의 syscall wrapper 를 모두 손으로 작성하지는 않는다. 대부분은 **<code class="inline-code">syscalls.list</code>** 라는 표 형식 파일에서 자동 생성된다. master 의 <code class="inline-code">sysdeps/unix/sysv/linux/syscalls.list</code>:</p>
+<pre class="code-block lang-text"><code># [user-space - glibc sysdeps/unix/sysv/linux/syscalls.list master 일부]
+# File name     Caller    Syscall name # args       Strong name      Weak names
+
+access          -         access        i:si      __access         access
+acct            -         acct          i:S       acct
+adjtimex        -         adjtimex      i:p       __adjtimex       adjtimex
+brk             -         brk           i:b       __brk            brk
+chdir           -         chdir         i:s       __chdir          chdir
+chmod           -         chmod         i:si      __chmod          chmod
+chown           -         chown32       i:sii     __chown          chown
+chroot          -         chroot        i:s       chroot
+close           -         close         Ci:i      __libc_close     __close close
+...</code></pre>
+<p>각 행이 한 syscall wrapper 의 모든 정보를 담는다.</p>
+<pre class="code-block lang-text"><code>[syscalls.list 형식의 의미]
+
+  File name      : 생성할 .c 파일 이름 (또는 - = 없음)
+  Caller         : caller 식별 (- = 없음)
+  Syscall name   : kernel 의 SYS_xxx 이름
+  # args         : 인자 개수 + 타입 인코딩 (예: i:si = int 반환, string + int 인자)
+  Strong name    : 강한 심볼 이름 (__chown 등)
+  Weak names     : 약한 심볼 이름들 (chown 등)</code></pre>
+<p>빌드 시점에 — glibc 의 <code class="inline-code">make-syscalls.sh</code> 스크립트가 이 표를 읽고 자동으로 wrapper 함수들을 생성한다. 사람이 코드를 작성한 게 아니라, 매크로와 빌드 시스템이 생성한 것.</p>
+<p>이 자동 생성 시스템이 — glibc 에 수백 개의 wrapper 가 있어도 유지보수가 가능한 이유다. 새 syscall 이 kernel 에 추가되면 <code class="inline-code">syscalls.list</code> 에 한 줄만 추가하면 된다.</p>
+<h3 id="glibc-와-musl-의-디자인-차이-정리">glibc 와 musl 의 디자인 차이 — 정리</h3>
+<p>두 구현체의 디자인 차이를 정리하면:</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────┬─────────────────────┬─────────────────────┐
+│ 항목                      │ glibc               │ musl                │
+├─────────────────────────┼─────────────────────┼─────────────────────┤
+│ wrapper 생성 방식         │ 자동 생성 (.list)    │ 명시적 .c 파일       │
+│ 별칭 (alias)            │ 다중 (__libc_X, __X) │ 보통 단일            │
+│ Cancellation 처리        │ 정교한 매크로 시스템   │ _cp 접미사 + 단순    │
+│ 매크로 깊이               │ 여러 층              │ 얕음                 │
+│ 라인 수 (전체)            │ ~ 1.4M 줄           │ ~ 90K 줄            │
+│ 바이너리 크기 (.so)       │ ~ 2 MB              │ ~ 600 KB            │
+│ 정적 링킹                 │ 거대                │ 매우 작음             │
+│ 디자인 철학               │ 호환성, 기능 풍부     │ 단순함, 표준 준수      │
+└─────────────────────────┴─────────────────────┴─────────────────────┘</code></pre>
+<p>같은 syscall 이라도 — glibc 의 write 는 매크로를 펼치면 수백 줄이고, musl 의 write 는 7 줄이다. 양쪽 다 같은 일을 하지만, glibc 는 더 많은 코너 케이스를 처리하고 musl 은 더 단순함을 추구한다.</p>
+<h3 id="glibc-와-musl-의-erro-변환-비교">glibc 와 musl 의 erro 변환 비교</h3>
+<p>두 구현체의 에러 처리 차이도 흥미롭다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [glibc 의 에러 처리 - INLINE_SYSCALL 안에서]</span>
+<span class="hl-kw">if</span> (<span class="hl-fn">__glibc_unlikely</span> (<span class="hl-fn">INTERNAL_SYSCALL_ERROR_P</span> (resultvar, ))) {
+    <span class="hl-fn">__set_errno</span> (<span class="hl-fn">INTERNAL_SYSCALL_ERRNO</span> (resultvar, ));
+    resultvar = (<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span>) -<span class="hl-num">1</span>;
+}</code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [musl 의 에러 처리 - src/internal/syscall_ret.c master]</span>
+<span class="hl-kw">long</span> <span class="hl-fn">__syscall_ret</span>(<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r)
+{
+    <span class="hl-kw">if</span> (r &gt; -<span class="hl-num">4096UL</span>) {
+        errno = -r;
+        <span class="hl-kw">return</span> -<span class="hl-num">1</span>;
+    }
+    <span class="hl-kw">return</span> r;
+}</code></pre>
+<p>본질은 같지만 — glibc 는 매크로로 처리하고, musl 은 별도 함수로 처리한다. musl 의 방식이 더 직관적이지만, glibc 의 매크로 방식이 더 최적화 여지가 있다 (inline 됨).</p>
+<h3 id="직접-syscall-을-호출하는-코드-wrapper-없이">직접 syscall 을 호출하는 코드 — wrapper 없이</h3>
+<p>가끔은 wrapper 없이 syscall 을 직접 호출하고 싶을 때가 있다. inline assembly 로 가능하다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - inline assembly 로 직접 syscall 호출]</span>
+#include &lt;unistd.h&gt;
+#include &lt;sys/syscall.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">long</span> ret;
+    <span class="hl-kw">const</span> <span class="hl-kw">char</span> *msg = <span class="hl-str">&quot;hello, kernel\n&quot;</span>;
+    
+    <span class="hl-co">/* x86_64 inline assembly */</span>
+    <span class="hl-kw">asm</span> <span class="hl-kw">volatile</span> (
+        <span class="hl-str">&quot;syscall&quot;</span>
+        : <span class="hl-str">&quot;=a&quot;</span> (ret)                  <span class="hl-co">/* output: rax */</span>
+        : <span class="hl-str">&quot;0&quot;</span> (SYS_write),            <span class="hl-co">/* input: rax = SYS_write */</span>
+          <span class="hl-str">&quot;D&quot;</span> (<span class="hl-num">1</span>),                    <span class="hl-co">/* rdi = fd */</span>
+          <span class="hl-str">&quot;S&quot;</span> (msg),                  <span class="hl-co">/* rsi = buf */</span>
+          <span class="hl-str">&quot;d&quot;</span> (<span class="hl-num">14</span>)                    <span class="hl-co">/* rdx = count */</span>
+        : <span class="hl-str">&quot;rcx&quot;</span>, <span class="hl-str">&quot;r11&quot;</span>, <span class="hl-str">&quot;memory&quot;</span>      <span class="hl-co">/* clobbered */</span>
+    );
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>GCC 의 constraint 들의 의미:</p>
+<pre class="code-block lang-text"><code>[GCC inline assembly constraints — syscall 호출]
+
+  &quot;=a&quot; → output 이 rax 에
+  &quot;0&quot;  → input 이 첫 번째 output 과 같은 register (= rax)
+  &quot;D&quot;  → input 이 rdi 에
+  &quot;S&quot;  → input 이 rsi 에
+  &quot;d&quot;  → input 이 rdx 에
+  
+  clobber:
+  &quot;rcx&quot;, &quot;r11&quot; → syscall 명령어가 망가뜨리는 register
+  &quot;memory&quot;     → syscall 이 메모리를 변경할 수 있음
+                  (컴파일러가 register 캐싱 무효화)</code></pre>
+<p>이 코드를 컴파일하고 실행하면 <code class="inline-code">hello, kernel\n</code> 이 출력된다. <strong>libc 의 write() 함수를 한 번도 거치지 않고</strong> kernel 의 sys_write 가 호출된다. errno 설정이나 -1 반환 같은 처리는 없으니, 사용자가 직접 해야 한다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>syscall wrapper 의 본체는 — 결국 매우 단순하다.</p>
+<pre class="code-block lang-text"><code>[모든 syscall wrapper 의 공통 구조]
+
+1. 인자를 정해진 register 에 배치
+2. syscall 번호를 rax (또는 x8, a7 등) 에 로드
+3. syscall (또는 svc, ecall) 명령어 실행
+4. 결과 검사: 에러 범위 (-4095 ~ -1) 면 errno 설정 + -1 반환
+5. 정상이면 결과 반환</code></pre>
+<p>glibc 는 이걸 매크로로 추상화해서 수백 개의 wrapper 를 자동 생성하고, musl 은 각 wrapper 를 명시적 .c 파일로 짧게 쓴다. 두 접근 다 같은 일을 한다.</p>
+<p>다음 장에서는 영역 (b) 의 추상화 층 — 같은 syscall wrapper 들 위에 어떻게 정교한 추상화가 쌓이는지 — 를 본다. 시작은 stdio 의 buffering 메커니즘이다.</p>
+<h2 class="section-heading" id="11-추상화-층의-정체"><span class="section-num">11</span><span class="section-title">추상화 층의 정체</span></h2>
+<p>이 장은 libc 의 영역 (b) — 추상화 층 — 을 본다. syscall wrapper 위에 어떻게 정교한 자료구조와 상태 관리가 쌓이는지, 그래서 한 함수 호출이 syscall 의 횟수와 어떻게 분리되는지를 본다.</p>
+<p>추상화 층은 libc 의 가장 흥미로운 영역이다. <strong>사용자 인터페이스와 syscall 사이의 거리가 멀수록 추상화 가치가 크다</strong>. 후속 Part 에서 깊이 다룰 주요 추상화 — malloc, stdio, pthread — 의 핵심 아이디어를 미리 본다.</p>
+<h3 id="추상화의-공통-패턴">추상화의 공통 패턴</h3>
+<p>영역 (b) 의 모든 함수는 — syscall wrapper 위에 다음 다섯 가지 중 하나 또는 여러 개의 layer 를 얹는다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ 추상화 layer 의 다섯 종류                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. State (상태 관리)                                          │
+│     예: stdio 의 FILE*, malloc 의 arena                       │
+│                                                              │
+│  2. Buffer (사용자 공간 버퍼링)                                  │
+│     예: stdio 의 buffer, getline 의 동적 buffer                │
+│                                                              │
+│  3. Caching (재사용 캐시)                                       │
+│     예: malloc 의 tcache, dlopen 의 라이브러리 캐시              │
+│                                                              │
+│  4. Multi-syscall composition (여러 syscall 묶음)              │
+│     예: getaddrinfo (여러 socket 조작), printf (여러 write)    │
+│                                                              │
+│  5. Lazy init (지연 초기화)                                     │
+│     예: pthread 자료구조, locale, dynamic linker                │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<p>각 layer 가 — <strong>사용자 호출과 syscall 사이의 직접 1:1 관계를 깬다</strong>. 호출 1번에 syscall 0번이 될 수도, 여러 번이 될 수도 있다. 이게 영역 (b) 의 정의다.</p>
+<h3 id="사례-1-stdio-의-buffering">사례 1 — stdio 의 buffering</h3>
+<p>가장 친숙한 예. 사용자가 <code class="inline-code">printf(&quot;a&quot;)</code> 를 100 번 호출하면 syscall 은 몇 번 일어날까?</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 일반적인 응용 코드]</span>
+<span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">100</span>; i++) {
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;a&quot;</span>);
+}
+<span class="hl-fn">fflush</span>(stdout);</code></pre>
+<p>직관: &quot;100 번 printf 했으니 syscall 도 100 번?&quot; — 틀렸다. 보통 <strong>1번 또는 0번</strong>이다.</p>
+<pre class="code-block lang-text"><code>[printf 의 실제 동작 — stdout 이 fully buffered 일 때]
+
+  Call 1:  printf(&quot;a&quot;)
+            → vfprintf 가 &#x27;a&#x27; 를 stdout 의 buffer 에 append
+            → buffer: &quot;a&quot;
+            → syscall 없음
+            
+  Call 2:  printf(&quot;a&quot;)
+            → buffer: &quot;aa&quot;
+            → syscall 없음
+            
+  Call 3~99: ...
+            → buffer: &quot;aaa...a&quot; (99 글자)
+            → syscall 없음
+            
+  Call 100: printf(&quot;a&quot;)
+            → buffer: &quot;aaa...a&quot; (100 글자)
+            → syscall 없음 (buffer 가 아직 안 참)
+            
+  fflush(stdout):
+            → write(1, &quot;aaa...a&quot;, 100)
+            → syscall 1번</code></pre>
+<p><code class="inline-code">printf</code> 호출 100 번이 <code class="inline-code">write</code> syscall <strong>1 번</strong>으로 압축된다. buffer 가 그 변환을 수행한다.</p>
+<h3 id="vfprintf-의-master-구조">vfprintf 의 master 구조</h3>
+<p>master 의 <code class="inline-code">stdio-common/vfprintf-internal.c</code> 가 vfprintf 의 본체를 가진다. 핵심 흐름을 단순화해서 보면:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc vfprintf-internal.c master 단순화]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">__vfprintf_internal</span>(<span class="hl-kw">FILE</span> *s, <span class="hl-kw">const</span> CHAR_T *format, va_list ap,
+                        <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> mode_flags)
+{
+    <span class="hl-co">/* Sanity check */</span>
+    <span class="hl-fn">ARGCHECK</span>(s, format);
+    
+    <span class="hl-co">/* Unbuffered 스트림이면 임시 buffer 만들어 우회 */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">UNBUFFERED_P</span>(s)) {
+        <span class="hl-kw">return</span> <span class="hl-fn">buffered_vfprintf</span>(s, format, ap, mode_flags);
+    }
+    
+    <span class="hl-co">/* Lock stream (thread-safe) */</span>
+    <span class="hl-fn">_IO_acquire_lock_clear_flags2</span>(s);
+    
+    <span class="hl-co">/* format string 을 한 글자씩 처리 */</span>
+    <span class="hl-kw">do</span> {
+        <span class="hl-co">/* %d, %s 등을 만나면 변환해서 buffer 에 출력 */</span>
+        <span class="hl-co">/* 일반 문자는 그대로 buffer 에 출력 */</span>
+        ...
+    } <span class="hl-kw">while</span> (*f != <span class="hl-fn">L_</span>(<span class="hl-str">&#x27;\0&#x27;</span>));
+    
+    <span class="hl-co">/* Unlock stream */</span>
+    <span class="hl-fn">_IO_release_lock</span>(s);
+    
+    <span class="hl-kw">return</span> done;
+}</code></pre>
+<p>가장 흥미로운 부분은 **<code class="inline-code">buffered_vfprintf</code>** 다. unbuffered 스트림 (<code class="inline-code">stderr</code> 같은) 도 임시 buffer 를 stack 에 만들어 그 위에서 작업한 후 한 번에 출력한다. master 의 본체:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc stdio-common/vfprintf.c master 단순화]</span>
+<span class="hl-kw">static</span> <span class="hl-kw">int</span>
+<span class="hl-fn">buffered_vfprintf</span>(_IO_FILE *s, <span class="hl-kw">const</span> CHAR_T *format, _IO_va_list args)
+{
+    CHAR_T buf[_IO_BUFSIZ];          <span class="hl-co">/* stack 위의 임시 buffer */</span>
+    <span class="hl-kw">struct</span> helper_file helper;
+    _IO_FILE *hp = (_IO_FILE *) &amp;helper._f;
+    <span class="hl-kw">int</span> result, to_flush;
+
+    <span class="hl-co">/* Initialize helper - 임시 가짜 FILE* */</span>
+    helper._put_stream = s;
+    <span class="hl-fn">_IO_setp</span>(hp, buf, buf + <span class="hl-kw">sizeof</span> buf);
+    hp-&gt;_IO_file_flags = _IO_MAGIC|_IO_NO_READS|_IO_USER_LOCK;
+    ...
+    
+    <span class="hl-co">/* 재귀적으로 vfprintf 호출 — 이번엔 hp 가 buffered */</span>
+    result = <span class="hl-fn">vfprintf</span>(hp, format, args);
+    
+    <span class="hl-co">/* 마지막에 실제 stream 에 한 번에 write */</span>
+    ...
+}</code></pre>
+<p><code class="inline-code">_IO_BUFSIZ</code> 가 buffer 크기 — 보통 8192 바이트. 즉 unbuffered stream 도 한 번의 vfprintf 호출 안에서는 stack 의 임시 buffer 에 누적했다가, 마지막에 한 번 write syscall 로 flush.</p>
+<h3 id="file-의-buffering-mode">FILE 의 buffering mode</h3>
+<p>stdio buffer 의 동작은 stream 의 buffering mode 에 따라 다르다. POSIX 가 세 종류를 정의한다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────┬──────────────────────────────────────────┐
+│ Mode             │ 동작                                       │
+├──────────────────┼──────────────────────────────────────────┤
+│ Fully buffered   │ buffer 가 차야 flush                       │
+│                  │ 또는 명시적 fflush() 호출 시               │
+│                  │ → 기본: 파일 stream, stdout (터미널 아닐 때) │
+│                  │                                            │
+│ Line buffered    │ 줄바꿈 (&#x27;\n&#x27;) 만나면 flush                  │
+│                  │ 또는 buffer 가 차면 flush                   │
+│                  │ → 기본: stdout (터미널일 때)                │
+│                  │                                            │
+│ Unbuffered       │ 매 호출마다 즉시 syscall                    │
+│                  │ → 기본: stderr                              │
+└──────────────────┴──────────────────────────────────────────┘</code></pre>
+<p>이 차이가 매우 흥미로운 결과를 만든다. 같은 프로그램이 터미널에서 실행되느냐 파일로 redirect 되느냐에 따라 stdout 의 buffering 이 달라진다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 같은 코드, 다른 결과]</span>
+<span class="hl-fn">printf</span>(<span class="hl-str">&quot;hello&quot;</span>);
+<span class="hl-fn">sleep</span>(<span class="hl-num">10</span>);
+<span class="hl-fn">printf</span>(<span class="hl-str">&quot;, world\n&quot;</span>);</code></pre>
+<pre class="code-block lang-text"><code>[실행 환경별 동작]
+
+터미널에서 실행:
+  stdout = line buffered
+  → &quot;hello&quot; 가 즉시 안 보임 (\n 없으니까)
+  → 10초 후 &quot;hello, world\n&quot; 한 번에 출력
+  
+파일로 redirect ($ ./prog &gt; out):
+  stdout = fully buffered
+  → &quot;hello&quot; 도 안 보임, &quot;hello, world\n&quot; 도 안 보임
+  → 프로그램 종료 시 (또는 4KB+ 출력 시) 한 번에 flush
+  
+stderr 로 출력:
+  stderr = unbuffered
+  → &quot;hello&quot; 가 즉시 출력
+  → 10초 sleep
+  → &quot;, world\n&quot; 출력</code></pre>
+<p>같은 코드가 환경에 따라 다르게 동작하는 이유는 — stdio 의 buffer 가 환경을 감지해서 mode 를 자동 선택하기 때문이다.</p>
+<h3 id="사례-2-malloc-의-brk-mmap-추상화">사례 2 — malloc 의 brk/mmap 추상화</h3>
+<p>malloc 은 더 정교한 추상화의 좋은 예다. <code class="inline-code">malloc(size)</code> 가 호출되어도 — <strong>대부분의 경우 syscall 이 발생하지 않는다</strong>.</p>
+<pre class="code-block lang-text"><code>[malloc 의 일반적 호출 패턴]
+
+  malloc(100):
+    → arena 의 free list 에서 100 바이트 chunk 찾음
+    → 발견 → 그 chunk 반환 (syscall 없음)
+    → 못 찾으면 → brk 또는 mmap 으로 OS 에서 더 큰 영역 받기 (syscall 1번)
+                  → 그걸 잘라서 100 바이트 chunk 반환
+                  
+  free(p):
+    → chunk 를 arena 의 free list 로 반환
+    → 보통 syscall 없음 (메모리를 OS 에 즉시 안 돌려줌)
+    → 가끔: 큰 영역이 모두 free 되면 brk(축소) 또는 munmap (syscall 1번)</code></pre>
+<p>이 디자인의 결과로 — 일반적 응용 프로그램이 <code class="inline-code">malloc/free</code> 를 수십만 번 호출해도 syscall 은 수십 번~수백 번 정도다. 비율이 1000:1 이상이 흔하다.</p>
+<h3 id="glibc-malloc-의-핵심-자료구조">glibc malloc 의 핵심 자료구조</h3>
+<p>master 의 <code class="inline-code">malloc/malloc.c</code> 에 정의된 핵심 자료구조들:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc malloc/malloc.c master 단순화]</span>
+
+<span class="hl-co">/* arena - 메모리 관리의 단위 */</span>
+<span class="hl-kw">struct</span> malloc_state {
+    __libc_lock_t mutex;        <span class="hl-co">/* arena 의 lock */</span>
+    <span class="hl-kw">int</span> flags;
+    
+    <span class="hl-co">/* fast bins - 작은 chunk 의 LIFO 리스트 */</span>
+    mfastbinptr fastbinsY[NFASTBINS];
+    
+    <span class="hl-co">/* top chunk - 큰 free 영역의 끝 */</span>
+    mchunkptr top;
+    
+    <span class="hl-co">/* bins - small/large chunk 의 양방향 리스트 */</span>
+    mchunkptr bins[NBINS * <span class="hl-num">2</span> - <span class="hl-num">2</span>];
+    
+    <span class="hl-co">/* multiple arena 들의 linked list */</span>
+    <span class="hl-kw">struct</span> malloc_state *next;
+    
+    ...
+};
+
+<span class="hl-co">/* tcache - thread-local 캐시 (glibc 2.26+) */</span>
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> tcache_entry {
+    <span class="hl-kw">struct</span> tcache_entry *next;
+    <span class="hl-kw">struct</span> tcache_perthread_struct *key;  <span class="hl-co">/* double-free 감지 */</span>
+} tcache_entry;
+
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> tcache_perthread_struct {
+    <span class="hl-kw">uint16_t</span> counts[TCACHE_MAX_BINS];
+    tcache_entry *entries[TCACHE_MAX_BINS];
+} tcache_perthread_struct;</code></pre>
+<p>다섯 가지 자료구조가 협력한다:</p>
+<pre class="code-block lang-text"><code>┌──────────────────────────────────────────────────────────────┐
+│ glibc malloc 의 자료구조 계층                                    │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  1. tcache (per-thread)                                       │
+│     thread 마다 별개의 작은 캐시                                 │
+│     lock 없이 빠른 할당                                          │
+│     크기별 64 개의 단일 연결 리스트                               │
+│                                                               │
+│  2. fast bins (per-arena)                                     │
+│     작은 chunk (≤ 128 바이트) 의 LIFO                          │
+│     매우 빠른 할당/반환                                          │
+│                                                               │
+│  3. unsorted bin (per-arena)                                  │
+│     방금 free 된 chunk 들의 임시 보관                            │
+│     다음 malloc 에서 적합하면 즉시 사용                           │
+│                                                               │
+│  4. small bins, large bins (per-arena)                        │
+│     크기별로 분류된 long-term free list                          │
+│                                                               │
+│  5. top chunk (per-arena)                                     │
+│     arena 의 끝에 있는 큰 free 영역                              │
+│     모자라면 brk/mmap 으로 확장                                  │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+<p><strong>할당 우선순위</strong>: tcache → fast bins → unsorted bin → small/large bins → top chunk → brk/mmap. 빠른 layer 부터 시도하고, 모두 실패하면 OS 로.</p>
+<h3 id="brk-vs-mmap-의-분기점">brk vs mmap 의 분기점</h3>
+<p>glibc 가 OS 에서 메모리를 받을 때 — <code class="inline-code">brk</code> 와 <code class="inline-code">mmap</code> 둘 중 하나를 선택한다. 기준은 <strong>요청 크기</strong>다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc malloc/malloc.c master 의 분기 로직 단순화]</span>
+<span class="hl-kw">if</span> (req_size &gt;= mp_.mmap_threshold) {
+    <span class="hl-co">/* 큰 요청 → mmap (독립 영역) */</span>
+    <span class="hl-kw">return</span> <span class="hl-fn">mmap_chunk</span>(req_size);
+} <span class="hl-kw">else</span> {
+    <span class="hl-co">/* 작은 요청 → brk (heap 끝 확장) */</span>
+    <span class="hl-kw">return</span> <span class="hl-fn">brk_chunk</span>(req_size);
+}</code></pre>
+<p><code class="inline-code">mmap_threshold</code> 의 기본값은 <strong>128 KB</strong> (<code class="inline-code">DEFAULT_MMAP_THRESHOLD = 128 * 1024</code>). 이 값은 동적으로 조정된다 (free 된 mmap chunk 의 크기에 따라).</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ brk vs mmap 의 비교                                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  brk (heap)                                                  │
+│   - 단일 연속 영역 (heap)                                      │
+│   - 확장만 가능, 중간 free 어려움                               │
+│   - 작은 할당에 적합                                            │
+│   - fragmentation 문제                                        │
+│                                                              │
+│  mmap (독립 영역)                                              │
+│   - 각 할당이 독립된 가상 메모리 영역                            │
+│   - munmap 으로 즉시 OS 에 반환 가능                             │
+│   - 큰 할당에 적합                                              │
+│   - 페이지 단위로 정렬                                          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<pre class="code-block lang-text"><code>[malloc 의 메모리 layout]
+
+  process 의 주소 공간:
+  
+    high address
+       ┌────────────────────────┐
+       │ stack                  │ ↓
+       ├────────────────────────┤
+       │ ★ mmap 영역들 (각자 독립) │  ← 큰 malloc (128KB+) 의 결과
+       │   ┌──┐                  │
+       │   │  │                  │
+       │   └──┘                  │
+       │   ┌────┐                │
+       │   │    │                │
+       │   └────┘                │
+       ├────────────────────────┤
+       │ 라이브러리 (libc, ld)     │
+       ├────────────────────────┤
+       │ ★ heap (brk 로 확장)     │  ← 작은 malloc (128KB-) 의 결과
+       │   ┌──┐                  │
+       │   │  │                  │
+       │   ├──┤                  │
+       │   │  │                  │
+       │   └──┘                  │
+       ├────────────────────────┤
+       │ .bss                    │
+       ├────────────────────────┤
+       │ .data                   │
+       ├────────────────────────┤
+       │ .text                   │
+       └────────────────────────┘
+    low address</code></pre>
+<p>자세한 내용은 Part IV 에서 다룬다. 여기서는 — <strong>malloc 이 사용자의 호출 1번을 syscall 0번 ~ 1번 (드물게)</strong> 으로 변환하는 그 비율이 추상화의 가치라는 점만 보면 된다.</p>
+<h3 id="사례-3-getaddrinfo-의-multi-syscall-composition">사례 3 — getaddrinfo 의 multi-syscall composition</h3>
+<p><code class="inline-code">getaddrinfo(3)</code> 는 호스트 이름을 IP 주소로 변환하는 함수다. 한 호출 안에서 여러 syscall 이 일어난다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 호스트네임 → IP 변환]</span>
+<span class="hl-kw">struct</span> addrinfo hints = { .ai_family = AF_INET };
+<span class="hl-kw">struct</span> addrinfo *res;
+
+<span class="hl-fn">getaddrinfo</span>(<span class="hl-str">&quot;example.com&quot;</span>, <span class="hl-str">&quot;80&quot;</span>, &amp;hints, &amp;res);</code></pre>
+<p>이 한 줄의 결과로 — 내부에서 다음 syscall 들이 일어난다.</p>
+<pre class="code-block lang-text"><code>[getaddrinfo 가 실제 호출하는 syscall 들 (단순화)]
+
+1. /etc/nsswitch.conf 읽기
+   open + read + close      (3 syscall)
+   
+2. /etc/resolv.conf 읽기 (DNS 서버 정보)
+   open + read + close      (3 syscall)
+   
+3. /etc/hosts 읽기 (먼저 정적 매핑 확인)
+   open + read + close      (3 syscall)
+   
+4. UDP 소켓 생성 + DNS 쿼리
+   socket + connect + sendto + recvfrom + close   (5+ syscall)
+   
+5. (실패 시) 다른 DNS 서버 시도, TCP 폴백 등
+   추가 syscall ...
+
+Total: 보통 15~30 syscall</code></pre>
+<p><code class="inline-code">strace -e trace=network ./prog</code> 로 보면 실제로 수십 개의 syscall 이 일어나는 것을 볼 수 있다.</p>
+<p>이게 — <strong>단일 함수 호출이 매우 많은 syscall 의 sequence</strong> 로 변환되는 추상화의 극단이다. 사용자는 <code class="inline-code">getaddrinfo(&quot;example.com&quot;, ...)</code> 한 줄로 끝나지만, 내부는 매우 복잡한 multi-step 프로토콜이다.</p>
+<h3 id="사례-4-pthread_create-의-lazy-init">사례 4 — pthread_create 의 lazy init</h3>
+<p><code class="inline-code">pthread_create</code> 는 multi-syscall composition 이면서 동시에 lazy init 의 좋은 예다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 쓰레드 생성]</span>
+pthread_t t;
+<span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);</code></pre>
+<p>이 한 줄이 내부에서 일으키는 syscall:</p>
+<pre class="code-block lang-text"><code>[pthread_create 의 syscall 시퀀스 - glibc master 단순화]
+
+1. allocate_stack:
+   mmap (새 thread 의 stack + TLS 영역 할당)     1 syscall
+   
+2. 새 thread 의 TLS 초기화:
+   mprotect (guard page 설정)                    1 syscall
+   
+3. clone (실제 thread 생성):
+   clone (CLONE_VM | CLONE_FS | CLONE_FILES | ...)  1 syscall
+   ↑ 새 thread 의 시작점, stack pointer 지정
+   
+4. (필요 시) rseq 등록:
+   rseq                                          (1 syscall)
+
+Total: 보통 3~4 syscall</code></pre>
+<p>그리고 첫 호출 시에는 <strong>추가로</strong> lazy 초기화가 일어난다.</p>
+<pre class="code-block lang-text"><code>[첫 pthread_create 시 추가 init]
+
+- NPTL 자료구조 초기화
+- atfork handler 준비
+- libgcc_s.so 로드 (cancellation support)
+- ...
+
+→ 이건 first call 한 번만 발생</code></pre>
+<p>이 lazy init 패턴이 영역 (b) 의 또 다른 흔한 특징이다. <strong>첫 호출이 무겁고 이후 호출은 가벼움</strong>. malloc 의 첫 호출도 비슷하다 — heap 영역 확보, tcache 초기화 등.</p>
+<h3 id="printf-100번-vs-write-100번-실험">printf 100번 vs write 100번 — 실험</h3>
+<p>이 장을 마무리하면서, 추상화의 가치를 측정하는 실험을 보자. 같은 출력을 두 가지 방법으로:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 방법 1: printf 100번 (추상화 사용)]</span>
+#include &lt;stdio.h&gt;
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">100</span>; i++) {
+        <span class="hl-fn">printf</span>(<span class="hl-str">&quot;a&quot;</span>);
+    }
+    <span class="hl-fn">fflush</span>(stdout);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}
+
+<span class="hl-co">// [user-space - 방법 2: write 100번 (추상화 우회)]</span>
+#include &lt;unistd.h&gt;
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">100</span>; i++) {
+        <span class="hl-fn">write</span>(<span class="hl-num">1</span>, <span class="hl-str">&quot;a&quot;</span>, <span class="hl-num">1</span>);
+    }
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p><code class="inline-code">strace -c</code> 로 측정하면:</p>
+<pre class="code-block lang-text"><code>[strace 결과 — 방법 1 (printf)]
+
+  % time    seconds  usecs/call   calls    syscall
+  -------   --------  ----------  ------   --------
+   ...
+   100.00    ...         ...         1     write   ← 1번!
+   ...
+
+[strace 결과 — 방법 2 (write)]
+
+  % time    seconds  usecs/call   calls    syscall
+  -------   --------  ----------  ------   --------
+   ...
+   100.00    ...         ...       100     write   ← 100번!</code></pre>
+<p>같은 결과 (&quot;a&quot; 100 번) 를 출력하지만 — syscall 횟수가 <strong>100 배 차이</strong>. 각 syscall 이 약 100ns ~ 1μs 정도 걸리므로, 100 번의 차이가 누적되면 약 10μs ~ 100μs 의 latency 차이가 된다.</p>
+<p>대용량 출력에서는 이 차이가 더 커진다. 백만 개 정수를 출력하는 경우 — printf 는 약 100~250 번의 write syscall (8KB buffer 가 차는 횟수) 로 끝나지만, putc 또는 write 를 직접 쓰면 백만 번이 된다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>추상화 층은 — libc 가 syscall wrapper 의 모음이 아니라는 사실을 증명하는 영역이다.</p>
+<pre class="code-block lang-text"><code>[영역 (b) 의 가치 = syscall 횟수의 변화량]
+
+  대규모 (1000:1 이상) 압축:
+    stdio buffering (printf 등)
+    malloc/free (대부분 syscall 없음)
+    
+  중간 압축 (10:1 ~ 100:1):
+    fread/fwrite over read/write
+    
+  분해 (1:N):
+    getaddrinfo, pthread_create
+    한 호출 → 여러 syscall
+    
+  복잡한 상호작용:
+    locale, iconv, signal handling
+    상태 + 캐시 + lazy init 의 조합</code></pre>
+<p>각각의 추상화는 후속 Part 에서 깊이 다룬다 (Part IV malloc, Part V stdio, Part VI pthread). 여기서는 — <strong>추상화 층이 사용자 호출과 syscall 사이의 1:1 관계를 깬다</strong>는 핵심 사실만 확인했다.</p>
+<p>다음 장에서는 마지막 영역 (c) — kernel 을 전혀 호출하지 않는 순수 user-space 함수들 — 을 본다.</p>
+<h2 class="section-heading" id="12-순수-user-space-함수"><span class="section-num">12</span><span class="section-title">순수 user-space 함수</span></h2>
+<p>이 장은 영역 (c) — kernel 을 한 번도 호출하지 않는 함수들 — 을 본다. strcpy, strlen, memcpy, sin, cos, qsort, isalpha — 우리가 일상적으로 쓰는 많은 libc 함수들이 여기 속한다.</p>
+<p>이 영역의 특징은 단순하다 — <strong>CPU 안에서 메모리와 산술만 가지고 작업</strong>하고, 결과를 반환한다. 그게 전부다. syscall 도, errno 도, 상태도 없는 경우가 대부분이다.</p>
+<h3 id="영역-c-의-함수-카테고리">영역 (c) 의 함수 카테고리</h3>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ 순수 user-space 함수들의 카테고리                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. string 함수 (&lt;string.h&gt;)                                  │
+│     strlen, strcpy, strncpy, strcmp, strncmp,                │
+│     strchr, strrchr, strstr, strtok,                         │
+│     memcpy, memmove, memset, memcmp, memchr                  │
+│                                                              │
+│  2. 수학 함수 (&lt;math.h&gt;) — libm                                │
+│     sin, cos, tan, asin, acos, atan,                         │
+│     log, exp, sqrt, pow, ceil, floor,                        │
+│     fabs, fmod, frexp, ldexp, modf                           │
+│                                                              │
+│  3. 정렬/검색 (&lt;stdlib.h&gt;)                                     │
+│     qsort, bsearch                                           │
+│                                                              │
+│  4. 문자 분류 (&lt;ctype.h&gt;)                                       │
+│     isalpha, isdigit, isspace, isupper, islower,             │
+│     toupper, tolower                                          │
+│                                                              │
+│  5. 변환 함수 (&lt;stdlib.h&gt;)                                     │
+│     atoi, atol, atof, strtol, strtod,                        │
+│     (sprintf 의 정수→문자 부분도 여기)                          │
+│                                                              │
+│  6. wide character (&lt;wchar.h&gt;)                                │
+│     wcslen, wcscpy, wcscmp, ...                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<p>이 함수들은 <strong>kernel 진입이 없으니 매우 빠르다</strong>. 일반적으로 nanosecond 단위로 끝난다. 그리고 — <strong>표준화된 API</strong> 다. ISO C 또는 POSIX 표준에 정의되어 있어서, 어느 libc 구현체를 써도 같은 동작을 보장한다.</p>
+<h3 id="순진한-strlen-한-글자씩-읽기">순진한 strlen — 한 글자씩 읽기</h3>
+<p><code class="inline-code">strlen</code> 의 가장 단순한 구현은:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 순진한 strlen]</span>
+<span class="hl-kw">size_t</span> <span class="hl-fn">strlen</span>(<span class="hl-kw">const</span> <span class="hl-kw">char</span> *s) {
+    <span class="hl-kw">size_t</span> n = <span class="hl-num">0</span>;
+    <span class="hl-kw">while</span> (*s != <span class="hl-str">&#x27;\0&#x27;</span>) {
+        s++;
+        n++;
+    }
+    <span class="hl-kw">return</span> n;
+}</code></pre>
+<p>이게 동작하지만, 매우 느리다. 한 글자씩 읽으니 long string 에서는 비효율.</p>
+<h3 id="glibc-의-strlen-워드-단위-트릭">glibc 의 strlen — 워드 단위 트릭</h3>
+<p>master 의 <code class="inline-code">string/strlen.c</code> 는 훨씬 영리한 portable 구현을 가진다. 핵심은 — <strong>한 번에 한 word (4 또는 8 바이트) 씩 읽고</strong>, <strong>그 안에 NUL 바이트가 있는지를 산술 연산으로 검사</strong>.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc string/strlen.c master 단순화]</span>
+<span class="hl-kw">size_t</span> <span class="hl-fn">strlen</span>(<span class="hl-kw">const</span> <span class="hl-kw">char</span> *str)
+{
+    <span class="hl-kw">const</span> <span class="hl-kw">char</span> *char_ptr;
+    <span class="hl-kw">const</span> <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> *longword_ptr;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> longword, himagic, lomagic;
+
+    <span class="hl-co">/* 1. align 안 맞은 처음 몇 바이트는 byte-by-byte */</span>
+    <span class="hl-kw">for</span> (char_ptr = str;
+         ((<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span>) char_ptr &amp; (<span class="hl-kw">sizeof</span>(longword) - <span class="hl-num">1</span>)) != <span class="hl-num">0</span>;
+         ++char_ptr) {
+        <span class="hl-kw">if</span> (*char_ptr == <span class="hl-str">&#x27;\0&#x27;</span>)
+            <span class="hl-kw">return</span> char_ptr - str;
+    }
+
+    longword_ptr = (<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> *) char_ptr;
+    
+    <span class="hl-co">/* magic numbers: 64-bit 일 때 */</span>
+    himagic = <span class="hl-num">0x80808080L</span>;
+    lomagic = <span class="hl-num">0x01010101L</span>;
+    <span class="hl-kw">if</span> (<span class="hl-kw">sizeof</span>(longword) &gt; <span class="hl-num">4</span>) {
+        himagic = ((himagic &lt;&lt; <span class="hl-num">16</span>) &lt;&lt; <span class="hl-num">16</span>) | himagic;
+        lomagic = ((lomagic &lt;&lt; <span class="hl-num">16</span>) &lt;&lt; <span class="hl-num">16</span>) | lomagic;
+    }
+
+    <span class="hl-co">/* 2. word 단위로 한꺼번에 검사 */</span>
+    <span class="hl-kw">for</span> (;;) {
+        longword = *longword_ptr++;
+        
+        <span class="hl-co">/* trick: longword 안에 0 바이트가 있는지 산술로 검사 */</span>
+        <span class="hl-kw">if</span> (((longword - lomagic) &amp; ~longword &amp; himagic) != <span class="hl-num">0</span>) {
+            <span class="hl-co">/* NUL 발견! 정확한 위치 찾기 */</span>
+            <span class="hl-kw">const</span> <span class="hl-kw">char</span> *cp = (<span class="hl-kw">const</span> <span class="hl-kw">char</span> *) (longword_ptr - <span class="hl-num">1</span>);
+            
+            <span class="hl-kw">if</span> (cp[<span class="hl-num">0</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str;
+            <span class="hl-kw">if</span> (cp[<span class="hl-num">1</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">1</span>;
+            <span class="hl-kw">if</span> (cp[<span class="hl-num">2</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">2</span>;
+            <span class="hl-kw">if</span> (cp[<span class="hl-num">3</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">3</span>;
+            <span class="hl-kw">if</span> (<span class="hl-kw">sizeof</span>(longword) &gt; <span class="hl-num">4</span>) {
+                <span class="hl-kw">if</span> (cp[<span class="hl-num">4</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">4</span>;
+                <span class="hl-kw">if</span> (cp[<span class="hl-num">5</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">5</span>;
+                <span class="hl-kw">if</span> (cp[<span class="hl-num">6</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">6</span>;
+                <span class="hl-kw">if</span> (cp[<span class="hl-num">7</span>] == <span class="hl-num">0</span>) <span class="hl-kw">return</span> cp - str + <span class="hl-num">7</span>;
+            }
+        }
+    }
+}</code></pre>
+<p>이 magic-number 트릭이 핵심이다.</p>
+<pre class="code-block lang-text"><code>[strlen 의 magic number 트릭 — bit 단위 NUL 검출]
+
+  himagic = 0x80808080 80808080  (각 바이트의 MSB 만 set)
+  lomagic = 0x01010101 01010101  (각 바이트의 LSB 만 set)
+  
+  검사 식: (longword - lomagic) &amp; ~longword &amp; himagic
+  
+  어떻게 동작하는가?
+  
+  - 한 바이트 b 가 0 이면:
+      b - 0x01 = 0xff (under-flow!)
+      ~b = 0xff
+      0xff &amp; 0xff &amp; 0x80 = 0x80 (non-zero!)  ← NUL 검출
+      
+  - 한 바이트 b 가 0이 아니면 (예: b = &#x27;a&#x27; = 0x61):
+      b - 0x01 = 0x60
+      ~b = 0x9e
+      0x60 &amp; 0x9e &amp; 0x80 = 0x00              ← 정상</code></pre>
+<p>이 트릭으로 <strong>8 바이트를 한 번에 검사</strong>한다. 산술 명령어 몇 개로 — 8 개의 분기 명령어 (한 글자씩 비교) 를 대신한다. CPU 의 pipeline 활용도 훨씬 좋아져서, 일반적으로 4~8 배 빨라진다.</p>
+<h3 id="strcpy-의-비슷한-트릭">strcpy 의 비슷한 트릭</h3>
+<p><code class="inline-code">strcpy</code> 도 비슷한 word-level 트릭을 쓴다. master 의 <code class="inline-code">string/strcpy.c</code> 는 사실 매우 단순하다 — 실제 본체는 <code class="inline-code">__stpcpy</code> 에 위임한다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc string/strcpy.c master]</span>
+<span class="hl-kw">char</span> *
+<span class="hl-fn">STRCPY</span> (<span class="hl-kw">char</span> *dest, <span class="hl-kw">const</span> <span class="hl-kw">char</span> *src)
+{
+    <span class="hl-fn">__stpcpy</span> (dest, src);
+    <span class="hl-kw">return</span> dest;
+}</code></pre>
+<p><code class="inline-code">__stpcpy</code> 가 진짜 본체다. master 의 <code class="inline-code">string/stpcpy.c</code> 를 보면 — 그것 역시 portable 버전은 단순하고, SIMD 가속된 빠른 버전들은 <code class="inline-code">sysdeps/&lt;arch&gt;/multiarch/</code> 에 있다 (다음 13장에서 자세히 다룬다).</p>
+<p>흥미로운 점은 — strcpy 가 strlen 한 후 memcpy 하는 단순한 조합이라는 통념이 master 에 없다는 점이다. master 의 stpcpy 는 직접 byte-by-byte (또는 word-by-word) 로 복사하면서 NUL 도 함께 찾는다. 별개 두 단계로 나누는 것보다 캐시 친화적.</p>
+<h3 id="수학-함수-sin-cos-sqrt">수학 함수 — sin, cos, sqrt</h3>
+<p><code class="inline-code">&lt;math.h&gt;</code> 의 함수들은 모두 영역 (c) 다. CPU 의 부동소수점 명령어 또는 알고리즘만으로 결과를 계산한다.</p>
+<pre class="code-block lang-text"><code>[수학 함수의 구현 전략]
+
+  sqrt
+    → CPU 의 SQRTSD/SQRTSS 명령어 (x86_64) 또는 직접 알고리즘
+    → 단일 instruction 으로 끝날 수도 있음
+    
+  sin, cos, tan
+    → Taylor 또는 Chebyshev 다항식 근사
+    → CPU 의 FSIN, FCOS (x87) 또는 software 구현
+    → glibc 는 보통 software (정확도 보장 위해)
+    
+  log, exp, pow
+    → 다항식 근사 + bit manipulation
+    → 매우 빠른 hand-tuned 구현
+    
+  ceil, floor, round
+    → CPU 의 ROUND 명령어 또는 bit trick</code></pre>
+<p>glibc 의 sin 의 master 구현은 — IBM Accurate Mathematical Library (IBMlib) 이 원조다. master 의 <code class="inline-code">sysdeps/ieee754/dbl-64/s_sin.c</code> 에서 볼 수 있다. 수백 줄의 복잡한 코드인데 — 정확한 IEEE 754 결과를 보장하기 위해.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc s_sin.c master 핵심 부분 단순화]</span>
+<span class="hl-kw">double</span> <span class="hl-fn">__sin</span>(<span class="hl-kw">double</span> x)
+{
+    <span class="hl-co">/* x 의 절대값에 따라 다른 알고리즘 */</span>
+    <span class="hl-kw">double</span> t, res, cor;
+    mynumber u;
+    <span class="hl-kw">int</span> k;
+    
+    u.x = x;
+    k = u.i[HIGH_HALF] &amp; <span class="hl-num">0x7fffffff</span>;
+    
+    <span class="hl-kw">if</span> (k &lt; <span class="hl-num">0x3e400000</span>) {
+        <span class="hl-co">/* |x| &lt; 2^-27, sin(x) ≈ x */</span>
+        <span class="hl-kw">return</span> x;
+    } <span class="hl-kw">else</span> <span class="hl-kw">if</span> (k &lt; <span class="hl-num">0x3fe921fb</span>) {
+        <span class="hl-co">/* |x| &lt; pi/4, 다항식 근사 */</span>
+        <span class="hl-kw">return</span> <span class="hl-fn">polynomial_sin</span>(x);
+    } <span class="hl-kw">else</span> <span class="hl-kw">if</span> (k &lt; <span class="hl-num">0x40000000</span>) {
+        <span class="hl-co">/* |x| &lt; 2, sin(x) = cos(x - pi/2) 변환 */</span>
+        ...
+    }
+    ...
+}</code></pre>
+<p>크기에 따라 다른 알고리즘으로 분기. 작은 값은 단순한 근사로 끝내고, 큰 값은 복잡한 변환을 한다. 이게 영역 (c) 의 디자인 — <strong>kernel 진입 없이 CPU 와 메모리만으로 정확한 결과를 만든다</strong>.</p>
+<h3 id="qsort-의-본체">qsort 의 본체</h3>
+<p><code class="inline-code">qsort</code> 도 영역 (c) 다. master 의 <code class="inline-code">stdlib/qsort.c</code> 가 본체. <strong>이름과 달리 glibc 의 qsort 는 quicksort 가 아니다</strong> — mergesort 가 기본이고, 메모리 할당 실패 시 heapsort 로 fallback 한다.</p>
+<p>(이 디자인은 흥미로운 역사를 가진다. 2023년 10월에 quicksort/heapsort 기반의 introsort 로 변경되었다가, 2024년 1월에 다시 mergesort 로 되돌려졌다. 이유는 — POSIX 와 C 표준이 stability 를 요구하지 않지만, 많은 프로그램이 mergesort 의 stability 동작에 의존하고 있어서 — &quot;Hyrum&#x27;s Law&quot; 의 적용. master 는 stability 를 유지하기로 결정.)</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc stdlib/qsort.c master 단순화]</span>
+<span class="hl-kw">void</span> <span class="hl-fn">__qsort_r</span> (<span class="hl-kw">void</span> *<span class="hl-kw">const</span> pbase, <span class="hl-kw">size_t</span> total_elems, <span class="hl-kw">size_t</span> size,
+                __compar_d_fn_t cmp, <span class="hl-kw">void</span> *arg)
+{
+    <span class="hl-kw">size_t</span> total_size = total_elems * size;
+    <span class="hl-kw">char</span> *tmp = <span class="hl-kw">NULL</span>;
+    
+    <span class="hl-co">/* 적당한 크기면 mergesort */</span>
+    <span class="hl-kw">if</span> (size &lt;= MAX_THRESH || (tmp = <span class="hl-fn">malloc</span> (total_size)) != <span class="hl-kw">NULL</span>) {
+        <span class="hl-fn">qsort_r_mergesort</span> (pbase, total_elems, size, cmp, arg, tmp);
+    } <span class="hl-kw">else</span> {
+        <span class="hl-co">/* malloc 실패 시 heapsort 로 fallback */</span>
+        <span class="hl-kw">if</span> (!<span class="hl-fn">qsort_r_malloc</span> (pbase, total_elems, size, cmp, arg, total_size))
+            <span class="hl-fn">heapsort_r</span> (pbase, total_elems - <span class="hl-num">1</span>, size, cmp, arg);
+    }
+}
+<span class="hl-fn">libc_hidden_def</span> (__qsort_r)
+<span class="hl-fn">weak_alias</span> (__qsort_r, qsort_r)</code></pre>
+<p>매우 흥미로운 점은 — glibc qsort 는 메모리를 <strong>추가 할당</strong>한다는 것. mergesort 가 추가 메모리를 요구하므로 <code class="inline-code">malloc(total_size)</code> 으로 보조 buffer 를 잡는다. <strong>메모리 할당이 실패하면 — heapsort 로 fallback</strong>. heapsort 는 in-place 라 추가 메모리가 불필요.</p>
+<p>그래서 — qsort 는 보통 영역 (c) 지만, 가끔 malloc 호출로 영역 (b) 가 되기도 한다. 매우 큰 배열을 정렬하면 — 그 크기만큼의 임시 메모리가 잡힌다.</p>
+<p>이 fallback 디자인이 stability 의 미묘한 문제를 만든다. mergesort 는 stable 이지만 heapsort 는 unstable. 즉 — 일반적인 정렬은 stable 이지만, 시스템에 메모리가 부족하면 같은 입력의 같은 코드가 unstable 한 결과를 줄 수 있다. master 의 알려진 이슈.</p>
+<h3 id="ctype-함수-매우-빠른-lookup">ctype 함수 — 매우 빠른 lookup</h3>
+<p><code class="inline-code">isalpha</code>, <code class="inline-code">isdigit</code>, <code class="inline-code">tolower</code>, <code class="inline-code">toupper</code> 등은 매우 빠른 lookup table 로 구현되어 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc ctype 의 아이디어 단순화]</span>
+
+<span class="hl-co">/* 256 바이트 table, 각 바이트가 문자의 속성 비트들 */</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">const</span> <span class="hl-kw">unsigned</span> <span class="hl-kw">short</span> <span class="hl-kw">int</span> **<span class="hl-fn">__ctype_b_loc</span>(<span class="hl-kw">void</span>);
+
+#define _ISdigit  <span class="hl-num">0x0800</span>
+#define _ISalpha  <span class="hl-num">0x0400</span>
+#define _ISspace  <span class="hl-num">0x2000</span>
+...
+
+#define <span class="hl-fn">isdigit</span>(c) ((<span class="hl-fn">__ctype_b_loc</span>())[c] &amp; _ISdigit)
+#define <span class="hl-fn">isalpha</span>(c) ((<span class="hl-fn">__ctype_b_loc</span>())[c] &amp; _ISalpha)</code></pre>
+<p>함수 호출도 아닌 매크로 표현이라 — 컴파일러가 inline 으로 펼치면 lookup table 한 번 + bit AND 한 번이 전부. 1~2 nanosecond 안에 끝난다.</p>
+<p><code class="inline-code">__ctype_b_loc()</code> 는 — locale 마다 다른 table 을 가리키는 함수다. 이 부분이 약간의 추상화 (locale-aware) 를 만든다.</p>
+<h3 id="locale-aware-vs-locale-free-의-구분">locale-aware vs locale-free 의 구분</h3>
+<p>영역 (c) 안에서도 두 가지 변형이 있다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ locale 의존 / 비의존 구분                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Locale-free (어디서나 같은 결과):                                │
+│   strlen, strcpy, strncpy                                    │
+│   memcpy, memmove, memset                                    │
+│   atoi, atol (단순한 변환)                                     │
+│   sin, cos, sqrt                                             │
+│                                                              │
+│ Locale-aware (locale 에 따라 결과 다름):                        │
+│   strcoll  ← strcmp 의 locale 인식 버전                       │
+│   strxfrm                                                    │
+│   tolower, toupper (특정 locale 에서)                          │
+│   strtod, strtol (decimal separator 차이)                    │
+│   strftime, strptime                                         │
+│   isalpha (UTF-8 locale 에서)                                 │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<p>locale-aware 함수는 — <code class="inline-code">LC_*</code> 환경 변수나 <code class="inline-code">setlocale()</code> 호출에 따라 동작이 달라진다. 예를 들어 독일 locale 에서는 &quot;ä&quot; 도 isalpha 로 true 가 반환된다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - locale 의 영향 데모]</span>
+#include &lt;ctype.h&gt;
+#include &lt;locale.h&gt;
+#include &lt;stdio.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">char</span> c = <span class="hl-num">0xE4</span>;   <span class="hl-co">// &#x27;ä&#x27; in Latin-1</span>
+    
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;Default: %d\n&quot;</span>, <span class="hl-fn">isalpha</span>((<span class="hl-kw">unsigned</span> <span class="hl-kw">char</span>) c));  <span class="hl-co">// 0</span>
+    
+    <span class="hl-fn">setlocale</span>(LC_CTYPE, <span class="hl-str">&quot;de_DE.ISO-8859-1&quot;</span>);
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;German: %d\n&quot;</span>, <span class="hl-fn">isalpha</span>((<span class="hl-kw">unsigned</span> <span class="hl-kw">char</span>) c));   <span class="hl-co">// non-zero</span>
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>이 변동성 때문에 — locale-aware 함수는 약간의 추상화 cost 가 있다. lookup table 의 indirection 한 번이 추가된다. 그래도 여전히 nanosecond 단위로 끝나서 영역 (c) 다.</p>
+<h3 id="영역-c-의-가치-표준화와-이식성">영역 (c) 의 가치 — 표준화와 이식성</h3>
+<p>영역 (c) 의 함수들의 진짜 가치는 — 사실 속도가 아니다. <strong>표준화된 API</strong> 라는 점이다.</p>
+<pre class="code-block lang-text"><code>[영역 (c) 함수의 가치]
+
+  1. 표준화된 API
+     ISO C 표준, POSIX 표준
+     어느 libc 구현체에서도 같은 시그니처와 동작
+     
+  2. 이식성
+     Linux, BSD, macOS, Windows (MSVC) 모두 동일
+     코드를 컴파일러만 바꿔서 옮길 수 있음
+     
+  3. 검증된 정확도
+     수십 년간 사용되며 코너 케이스가 모두 처리됨
+     특히 수학 함수의 IEEE 754 준수
+     
+  4. 최적화의 집약
+     SIMD, alignment, branch prediction 모두 활용
+     사용자가 직접 짜는 것보다 훨씬 빠름
+     
+  5. 보안 검증
+     buffer overflow, UB, race 등 코너 케이스가 검증됨</code></pre>
+<p>특히 4번이 다음 장의 주제다 — 같은 strlen, memcpy 라도 SIMD 로 가속된 버전이 훨씬 빠르다. glibc 의 모든 string 함수에 SIMD 가속이 적용되어 있다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>영역 (c) 의 함수는 — libc 의 가장 단순한 영역이지만, 가장 자주 쓰이는 영역이기도 하다. 모든 C 프로그램이 strlen, strcpy, memcpy 를 쓰고, 많은 프로그램이 sin, cos, qsort 를 쓴다.</p>
+<pre class="code-block lang-text"><code>[영역 (c) 의 본질]
+
+  ✓ kernel 진입 없음 (syscall 0번)
+  ✓ 결과가 결정적 (locale 빼고)
+  ✓ ISO C / POSIX 표준에 정의됨
+  ✓ 매우 빠름 (nanosecond 단위)
+  ✓ 다른 영역의 빌딩 블록 (printf 안에서도 호출됨)</code></pre>
+<p>다음 장에서는 — 이 함수들이 어떻게 SIMD 명령어로 가속되어, glibc 가 어떻게 런타임에 가장 빠른 구현을 선택하는지를 본다. ifunc 메커니즘과 함께.</p>
+<h2 class="section-heading" id="13-simd-가속된-libc-함수"><span class="section-num">13</span><span class="section-title">SIMD 가속된 libc 함수</span></h2>
+<p>이 장은 영역 (c) 의 핵심 성능 최적화 — <strong>SIMD (Single Instruction Multiple Data) 가속</strong>과 <strong>ifunc (indirect function) 메커니즘</strong>을 본다. 같은 <code class="inline-code">memcpy</code>, <code class="inline-code">strlen</code> 라는 함수 이름이지만, 실행 시점에 CPU 가 지원하는 가장 빠른 구현이 선택되는 영리한 디자인이다.</p>
+<h3 id="simd-의-정체">SIMD 의 정체</h3>
+<p>SIMD 는 한 명령어로 여러 데이터를 동시에 처리하는 CPU 기능이다. x86 의 SSE/AVX, ARM 의 NEON 같은 명령어 셋이 SIMD 다.</p>
+<pre class="code-block lang-text"><code>[Scalar vs SIMD 비교 — 8 바이트 복사]
+
+  Scalar (일반 명령어):
+    mov  byte [dst+0], byte [src+0]
+    mov  byte [dst+1], byte [src+1]
+    mov  byte [dst+2], byte [src+2]
+    mov  byte [dst+3], byte [src+3]
+    mov  byte [dst+4], byte [src+4]
+    mov  byte [dst+5], byte [src+5]
+    mov  byte [dst+6], byte [src+6]
+    mov  byte [dst+7], byte [src+7]
+    → 8개 명령어
+
+  SIMD (SSE2):
+    movdqu xmm0, [src]      ; 128-bit (16 바이트) 한 번에 로드
+    movdqu [dst], xmm0      ; 한 번에 저장
+    → 2개 명령어로 16 바이트 처리
+
+  AVX (256-bit):
+    vmovdqu ymm0, [src]     ; 32 바이트 한 번에
+    vmovdqu [dst], ymm0
+    → 2개 명령어로 32 바이트 처리
+  
+  AVX-512 (512-bit):
+    vmovdqu zmm0, [src]     ; 64 바이트 한 번에
+    vmovdqu [dst], zmm0
+    → 2개 명령어로 64 바이트 처리</code></pre>
+<p>memcpy, memset, strlen 같은 <strong>bulk 데이터 처리 함수가 SIMD 의 가장 큰 수혜자</strong>다. 한 cycle 에 16~64 바이트를 처리할 수 있게 된다.</p>
+<h3 id="simd-명령어-셋의-종류">SIMD 명령어 셋의 종류</h3>
+<p>x86 과 ARM 의 SIMD 명령어 셋을 정리하면:</p>
+<pre class="code-block lang-text"><code>┌──────────────┬─────────────────┬───────────────────────────┐
+│ 아키텍처      │ SIMD 명령어 셋    │ 폭                          │
+├──────────────┼─────────────────┼───────────────────────────┤
+│ x86          │ MMX (옛)         │ 64-bit                    │
+│              │ SSE             │ 128-bit                   │
+│              │ SSE2 / SSE3 /   │ 128-bit                   │
+│              │ SSSE3 / SSE4    │ 128-bit                   │
+│              │ AVX             │ 256-bit                   │
+│              │ AVX2            │ 256-bit (integer 확장)     │
+│              │ AVX-512         │ 512-bit                   │
+│              │                 │                           │
+│ ARM (32)     │ NEON (Advanced  │ 128-bit                   │
+│              │  SIMD)          │                           │
+│              │                 │                           │
+│ ARM64        │ NEON (필수)      │ 128-bit                   │
+│              │ SVE             │ 128-bit ~ 2048-bit (가변)  │
+│              │ SVE2            │ 가변                        │
+└──────────────┴─────────────────┴───────────────────────────┘</code></pre>
+<p>문제는 — <strong>모든 CPU 가 모든 명령어 셋을 지원하지는 않는다</strong>. 2010년 이전 x86 CPU 는 AVX 가 없다. 2020년 이전 일반 소비자 CPU 는 AVX-512 가 없다. ARM64 의 SVE 는 매우 최근 (서버급 CPU) 에만 있다.</p>
+<p>binary 가 한 가지 명령어 셋만 사용하도록 컴파일된다면 — 옛 CPU 에서는 동작 안 하고, 새 CPU 의 빠른 명령어를 활용 못 한다. 이 문제를 어떻게 해결할까?</p>
+<h3 id="해결책-ifunc-indirect-function">해결책 — ifunc (Indirect Function)</h3>
+<p>GNU 의 답은 <strong>ifunc</strong> 다. <code class="inline-code">STT_GNU_IFUNC</code> 라는 ELF 심볼 타입을 도입해서 — <strong>한 함수 이름이 실행 시점에 여러 구현 중 하나로 분기</strong>되게 한다.</p>
+<pre class="code-block lang-text"><code>[ifunc 의 핵심 아이디어]
+
+  binary 에 여러 구현이 다 들어 있음:
+    memcpy_generic     (모든 CPU 에서 동작)
+    memcpy_sse2        (SSE2 지원 CPU 만)
+    memcpy_avx         (AVX 지원 CPU 만)
+    memcpy_avx512      (AVX-512 지원 CPU 만)
+    
+  + resolver 함수 하나:
+    memcpy_resolver()  → 현재 CPU 의 기능을 검사하고
+                         가장 빠른 구현을 반환
+    
+  사용자가 memcpy() 호출하면:
+    프로그램 시작 시 dynamic linker 가 resolver 호출
+    PLT 에 선택된 구현의 주소가 채워짐
+    이후 모든 호출이 그 구현을 직접 호출</code></pre>
+<p>이 메커니즘으로 — <strong>같은 binary 가 모든 CPU 에서 최적 성능을 낸다</strong>. 옛 CPU 면 generic, 새 CPU 면 AVX-512. 사용자 코드는 변경 불필요.</p>
+<h3 id="ifunc-의-동작-예제">ifunc 의 동작 예제</h3>
+<p>binutils 2.20.1 / glibc 2.11.1 이상에서 도입된 기능이다 (master 인용):</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - ifunc 사용 예]</span>
+#include &lt;stddef.h&gt;
+
+<span class="hl-co">/* 여러 구현 */</span>
+<span class="hl-kw">void</span> <span class="hl-fn">foo_c</span>(<span class="hl-kw">unsigned</span> *data, <span class="hl-kw">size_t</span> len)       { <span class="hl-co">/* generic */</span> }
+<span class="hl-kw">void</span> <span class="hl-fn">foo_sse42</span>(<span class="hl-kw">unsigned</span> *data, <span class="hl-kw">size_t</span> len)   { <span class="hl-co">/* SSE4.2 */</span> }
+<span class="hl-kw">void</span> <span class="hl-fn">foo_avx2</span>(<span class="hl-kw">unsigned</span> *data, <span class="hl-kw">size_t</span> len)    { <span class="hl-co">/* AVX2 */</span> }
+
+<span class="hl-co">/* CPU 기능 확인 */</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> <span class="hl-fn">cpu_has_sse42</span>(<span class="hl-kw">void</span>);
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> <span class="hl-fn">cpu_has_avx2</span>(<span class="hl-kw">void</span>);
+
+<span class="hl-co">/* resolver */</span>
+<span class="hl-kw">static</span> <span class="hl-kw">void</span> *<span class="hl-fn">resolve_foo</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">if</span> (<span class="hl-fn">cpu_has_avx2</span>())  <span class="hl-kw">return</span> foo_avx2;
+    <span class="hl-kw">if</span> (<span class="hl-fn">cpu_has_sse42</span>()) <span class="hl-kw">return</span> foo_sse42;
+    <span class="hl-kw">return</span> foo_c;
+}
+
+<span class="hl-co">/* foo 는 ifunc — resolver 가 실제 주소 결정 */</span>
+<span class="hl-kw">void</span> <span class="hl-fn">foo</span>(<span class="hl-kw">unsigned</span> *data, <span class="hl-kw">size_t</span> len)
+    <span class="hl-kw">__attribute__</span>((<span class="hl-fn">ifunc</span>(<span class="hl-str">&quot;resolve_foo&quot;</span>)));</code></pre>
+<p>이 binary 가 link 되면, ELF 에 <code class="inline-code">STT_GNU_IFUNC</code> 타입의 <code class="inline-code">foo</code> 심볼이 들어간다. 실행 시점:</p>
+<pre class="code-block lang-text"><code>[ifunc 의 실행 흐름]
+
+  1. dynamic linker (ld-linux.so) 가 binary 를 로드
+  
+  2. STT_GNU_IFUNC 심볼들을 찾음
+  
+  3. 각 심볼에 대해 resolver 함수 호출
+       resolve_foo() 가 호출됨
+       → CPU 검사
+       → foo_avx2 의 주소 반환 (예)
+  
+  4. PLT (Procedure Linkage Table) 의 foo 항목을 그 주소로 패치
+  
+  5. 사용자 코드가 foo() 호출 시:
+       PLT 거쳐서 foo_avx2 가 직접 호출
+       resolver 는 다시 안 부름</code></pre>
+<p>이 모든 일이 <strong>프로그램 시작 시 한 번</strong>만 일어난다. 이후 함수 호출은 — 일반 함수 호출과 같은 비용. ifunc 의 overhead 가 거의 zero.</p>
+<h3 id="glibc-의-ifunc-활용">glibc 의 ifunc 활용</h3>
+<p>glibc 는 — 성능 critical 한 거의 모든 string/memory 함수에 ifunc 를 적용한다. master 의 <code class="inline-code">sysdeps/x86_64/multiarch/</code> 디렉토리를 보면:</p>
+<pre class="code-block lang-text"><code>[glibc master sysdeps/x86_64/multiarch/ 의 일부]
+
+  memcpy.c                       ← ifunc resolver (memmove.S 의 구현 재사용)
+  memmove-sse2-unaligned-erms.S  ← SSE2 (memcpy 도 이걸 사용)
+  memmove-ssse3.S                ← SSSE3
+  memmove-avx-unaligned-erms.S   ← AVX
+  memmove-avx512-no-vzeroupper.S ← AVX-512
+  memmove-vec-unaligned-erms.S   ← 공통 구현 (다른 .S 들이 include)
+  
+  memset.c                       ← ifunc resolver
+  memset-sse2-unaligned-erms.S   ← SSE2
+  memset-avx2-unaligned-erms.S   ← AVX2
+  memset-avx512-no-vzeroupper.S  ← AVX-512
+  
+  strlen.c                       ← ifunc resolver
+  strlen-sse2.S
+  strlen-avx2.S
+  strlen-avx2-rtm.S
+  strlen-evex.S                  ← AVX-512 EVEX 인코딩
+  ...</code></pre>
+<p>흥미로운 사실 — <code class="inline-code">memcpy</code> 의 구현은 사실 <code class="inline-code">memmove</code> 와 공유된다. 두 함수의 차이는 — <code class="inline-code">memmove</code> 가 overlapping 영역도 안전하게 처리한다는 것뿐. master 는 <code class="inline-code">memmove-*-unaligned-erms.S</code> 들이 memcpy / memmove 모두에 쓰이도록 통합했다. 그래서 <code class="inline-code">memcpy-*.S</code> 라는 이름의 파일은 거의 없고, <code class="inline-code">memmove-*.S</code> 가 둘 다 담당.</p>
+<p>각 함수가 4~7 가지의 구현을 갖는다. CPU 에 따라 다른 구현이 선택된다.</p>
+<p><code class="inline-code">memcpy.c</code> 의 resolver 본체 (master 단순화):</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/x86_64/multiarch/memcpy.c master 단순화]</span>
+#define SYMBOL_NAME memcpy
+#include <span class="hl-str">&quot;ifunc-memmove.h&quot;</span>
+
+<span class="hl-fn">libc_ifunc_redirected</span>(__redirect_memcpy, __new_memcpy,
+                      <span class="hl-fn">IFUNC_SELECTOR</span>());
+
+<span class="hl-kw">static</span> <span class="hl-kw">inline</span> <span class="hl-kw">void</span> *<span class="hl-fn">IFUNC_SELECTOR</span>(<span class="hl-kw">void</span>)
+{
+    <span class="hl-kw">const</span> <span class="hl-kw">struct</span> cpu_features *cpu_features = <span class="hl-fn">__get_cpu_features</span>();
+    
+    <span class="hl-co">/* AVX-512 지원? */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">CPU_FEATURE_USABLE_P</span>(cpu_features, AVX512F)
+        &amp;&amp; !<span class="hl-fn">CPU_FEATURES_ARCH_P</span>(cpu_features, Prefer_No_AVX512))
+        <span class="hl-kw">return</span> <span class="hl-fn">OPTIMIZE</span>(avx512_no_vzeroupper);
+    
+    <span class="hl-co">/* AVX 지원? */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">CPU_FEATURE_USABLE_P</span>(cpu_features, AVX))
+        <span class="hl-kw">return</span> <span class="hl-fn">OPTIMIZE</span>(avx_unaligned_erms);
+    
+    <span class="hl-co">/* SSSE3? */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">CPU_FEATURE_USABLE_P</span>(cpu_features, SSSE3))
+        <span class="hl-kw">return</span> <span class="hl-fn">OPTIMIZE</span>(ssse3);
+    
+    <span class="hl-co">/* fallback: SSE2 (모든 x86_64 가 지원) */</span>
+    <span class="hl-kw">return</span> <span class="hl-fn">OPTIMIZE</span>(sse2_unaligned_erms);
+}</code></pre>
+<p>매우 정교한 분기. <code class="inline-code">CPU_FEATURES_ARCH_P</code> 는 CPU 가 명령어를 지원하더라도 그 모델에서 — <strong>그 명령어가 실제로 빠른가</strong>를 본다. 일부 CPU (특히 옛 AMD) 는 AVX-512 가 켜져 있지만 느려서 안 쓰는 게 낫다.</p>
+<h3 id="cpu-기능-검사-__get_cpu_features">CPU 기능 검사 — <code class="inline-code">__get_cpu_features</code></h3>
+<p><code class="inline-code">__get_cpu_features</code> 는 — <strong>프로그램 시작 시 한 번</strong> CPU 의 <code class="inline-code">CPUID</code> 명령어 (x86) 또는 <code class="inline-code">AT_HWCAP</code> (ARM) 를 읽어서 결과를 캐싱한 것이다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/x86/cpu-features.h master 단순화]</span>
+<span class="hl-kw">struct</span> cpu_features {
+    <span class="hl-kw">struct</span> cpuid_features cpuid[COMMON_CPUID_INDEX_MAX];
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> basic;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> kind;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> model;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> family;
+    
+    <span class="hl-co">/* preferred features (CPU 마다 더 빠른 것) */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> preferred[PREFERRED_FEATURE_INDEX_MAX];
+    
+    ...
+};
+
+<span class="hl-kw">const</span> <span class="hl-kw">struct</span> cpu_features *<span class="hl-fn">__get_cpu_features</span>(<span class="hl-kw">void</span>);</code></pre>
+<p>x86 의 경우 — glibc 가 부팅 초기에 <code class="inline-code">CPUID</code> 명령어를 여러 번 호출해서 — feature flag 들을 모두 읽는다. SSE, SSE2, SSSE3, AVX, AVX2, AVX-512 등 수십 가지의 비트가 설정된다. 그 결과를 전역 변수에 저장하고 — 이후 ifunc resolver 들이 그것을 읽는다.</p>
+<p>ARM64 는 비슷한 일을 <code class="inline-code">AT_HWCAP</code> auxiliary vector (Part I 8장 vDSO 부분 참조) 에서 한다.</p>
+<h3 id="실제-성능-차이">실제 성능 차이</h3>
+<p>이 모든 노력이 — 실제로 얼마나 빠른가? 측정값 (대략):</p>
+<pre class="code-block lang-text"><code>[memcpy 의 구현별 성능 (1KB 복사 기준)]
+
+  byte-by-byte loop:     ~ 1000 ns
+  word-by-word loop:     ~ 130 ns
+  SSE2 (16B at once):    ~ 50 ns
+  AVX (32B):             ~ 30 ns
+  AVX-512 (64B):         ~ 20 ns
+  
+  byte-by-byte 대비 AVX-512:  약 50배 빠름</code></pre>
+<pre class="code-block lang-text"><code>[strlen 의 구현별 성능 (1KB 문자열)]
+
+  byte-by-byte:          ~ 1000 ns
+  word-magic-number:     ~ 130 ns
+  SSE2 pcmpeqb + pmovmskb: ~ 30 ns
+  AVX2 vpcmpeqb:         ~ 18 ns
+  
+  → SIMD 가 약 50~60배 빠름</code></pre>
+<p>이 차이는 — 응용 프로그램이 데이터 처리 위주이면 매우 큰 영향이다. JSON 파서, 텍스트 검색, 데이터베이스 — 모두 string 함수에 의존하고, 그 성능이 ifunc 덕분에 자동으로 최적화된다.</p>
+<h3 id="simd-strlen-의-핵심-아이디어">SIMD strlen 의 핵심 아이디어</h3>
+<p>SIMD strlen 이 어떻게 빠른지 잠깐 본다. SSE2 의 경우:</p>
+<pre class="code-block lang-text"><code>[SSE2 strlen 의 idea]
+
+  1. 16 바이트 (XMM register 폭) 씩 로드
+  
+  2. pcmpeqb 명령어: 각 바이트를 0 과 비교
+       16 바이트 → 16 개의 비교 결과 (각 바이트가 0xff 또는 0x00)
+  
+  3. pmovmskb 명령어: 각 바이트의 MSB 를 모아 16-bit 마스크 생성
+       → 만약 mask = 0 이면 16 바이트 안에 NUL 없음
+       → mask != 0 이면 그 안에 NUL 있음, bsf 로 위치 찾기
+  
+  4. NUL 없으면 다음 16 바이트 로드, 반복</code></pre>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - SSE2 strlen 의 핵심 부분 어셈블리]</span>
+<span class="hl-co">; rdi = string 시작 주소</span>
+
+    <span class="hl-fn">pxor</span>    xmm0, xmm0          <span class="hl-co">; xmm0 = 16 개의 0 바이트</span>
+
+.loop:
+    <span class="hl-fn">movdqa</span>  xmm1, [rdi]         <span class="hl-co">; 16 바이트 로드 (aligned)</span>
+    <span class="hl-fn">pcmpeqb</span> xmm1, xmm0          <span class="hl-co">; 각 바이트를 0 과 비교</span>
+    <span class="hl-fn">pmovmskb</span> eax, xmm1          <span class="hl-co">; 16개 비교 결과를 16-bit 마스크로</span>
+    <span class="hl-kw">test</span>    eax, eax            <span class="hl-co">; mask == 0?</span>
+    <span class="hl-kw">jnz</span>     .found              <span class="hl-co">; non-zero 면 NUL 발견</span>
+    <span class="hl-kw">add</span>     rdi, <span class="hl-num">16</span>
+    <span class="hl-kw">jmp</span>     .loop
+
+.found:
+    <span class="hl-fn">bsf</span>     eax, eax            <span class="hl-co">; 첫 set bit 위치 (= NUL 위치)</span>
+    <span class="hl-kw">add</span>     rdi, rax            <span class="hl-co">; NUL 의 정확한 주소</span>
+    <span class="hl-kw">sub</span>     rdi, start          <span class="hl-co">; 길이 계산</span>
+    <span class="hl-kw">ret</span></code></pre>
+<p>3개의 명령어 (<code class="inline-code">movdqa</code>, <code class="inline-code">pcmpeqb</code>, <code class="inline-code">pmovmskb</code>) 로 16 바이트의 NUL 검사를 끝낸다. <strong>byte-by-byte 의 16분의 1</strong> 사이클 안에 — pipeline 효율까지 고려하면 30배 가까이 빠르다.</p>
+<h3 id="arm64-neon-의-비슷한-접근">ARM64 NEON 의 비슷한 접근</h3>
+<p>ARM64 NEON 도 같은 패턴이다. master 의 <code class="inline-code">sysdeps/aarch64/strlen.S</code> 에는:</p>
+<pre class="code-block lang-text"><code>[ARM64 NEON strlen 의 idea]
+
+  1. ld1 명령어로 16 바이트 (Q register 폭) 로드
+  
+  2. cmeq 명령어: 각 바이트와 0 비교
+       → 결과는 byte 별 0x00 또는 0xff
+  
+  3. shrn 명령어: 결과를 압축
+       16 바이트 결과 → 8 바이트 mask
+  
+  4. fmov 로 mask 를 GPR 로 이동
+  
+  5. NUL 없으면 다음 16 바이트, 반복</code></pre>
+<p>x86 의 <code class="inline-code">pmovmskb</code> 같은 직접적인 mask 명령어가 ARM64 에는 없다 (SVE 까지 가야 있음). 그래서 NEON 의 strlen 은 약간 다른 트릭을 쓰지만 — 본질은 동일.</p>
+<h3 id="simd-의-약점-짧은-데이터의-overhead">SIMD 의 약점 — 짧은 데이터의 overhead</h3>
+<p>SIMD 가 항상 빠른 건 아니다. <strong>짧은 데이터</strong> 에서는 — SIMD 의 setup overhead 가 더 클 수 있다.</p>
+<pre class="code-block lang-text"><code>[strlen 의 길이별 성능 비교]
+
+  string 길이     │ scalar 빠름  │ SIMD 빠름   │ 차이
+  ────────────────┼─────────────┼─────────────┼──────
+  5 bytes         │ ✓           │             │ scalar 가 약 2배 빠름
+  20 bytes        │             │ ✓           │ SIMD 가 약 1.5배 빠름
+  100 bytes       │             │ ✓           │ SIMD 가 약 5배 빠름
+  1000 bytes      │             │ ✓           │ SIMD 가 약 30배 빠름
+  10000 bytes     │             │ ✓           │ SIMD 가 약 50배 빠름</code></pre>
+<p>그래서 glibc 의 SIMD 함수는 — <strong>시작 부분에 길이 검사</strong>를 한다. 길이가 매우 짧으면 byte-by-byte loop 로, 길면 SIMD 본체로.</p>
+<pre class="code-block lang-text"><code>[glibc 의 SIMD strlen 시작 부분 패턴]
+
+  if (len &lt; SHORT_THRESHOLD) {
+      /* 짧으면 byte-by-byte 빠른 path */
+      return short_strlen(s);
+  }
+  
+  /* SIMD 본체 */
+  ...</code></pre>
+<p>이런 hybrid 디자인이 — glibc 의 string 함수가 어떤 입력에서도 빠른 이유다.</p>
+<h3 id="ld_debug-symbols-로-ifunc-보기"><code class="inline-code">LD_DEBUG=symbols</code> 로 ifunc 보기</h3>
+<p>dynamic linker 가 ifunc 를 처리하는 과정을 보는 방법이 있다.</p>
+<pre class="code-block lang-bash"><code><span class="hl-co"># [user-space - bash]</span>
+<span class="hl-co">$</span> <span class="hl-fn">LD_DEBUG</span>=symbols /bin/ls <span class="hl-num">2</span>&gt;&amp;<span class="hl-num">1</span> | <span class="hl-fn">grep</span> -i ifunc | <span class="hl-fn">head</span> -<span class="hl-num">20</span>
+       <span class="hl-num">28912</span>:     ifunc memcpy is resolver
+       <span class="hl-num">28912</span>:     ifunc memset is resolver
+       <span class="hl-num">28912</span>:     ifunc strlen is resolver
+       <span class="hl-num">28912</span>:     ifunc strcmp is resolver
+       <span class="hl-num">28912</span>:     ifunc strchr is resolver
+       <span class="hl-fn">...</span>
+       
+<span class="hl-co">$</span> <span class="hl-fn">LD_DEBUG</span>=bindings /bin/ls <span class="hl-num">2</span>&gt;&amp;<span class="hl-num">1</span> | <span class="hl-fn">grep</span> <span class="hl-str">&quot;memcpy&quot;</span> | <span class="hl-fn">head</span> -<span class="hl-num">5</span>
+       <span class="hl-num">28912</span>:     binding file /bin/ls [<span class="hl-num">0</span>] to /lib/x86_64-linux-gnu/libc.so.6 [<span class="hl-num">0</span>]: 
+                   <span class="hl-fn">normal</span> symbol `memcpy<span class="hl-str">&#x27; [GLIBC_2.14]</span>
+                   ↑ <span class="hl-fn">glibc</span> <span class="hl-num">2.14</span> 부터 ifunc 으로 변경됨</code></pre>
+<p><code class="inline-code">LD_DEBUG=symbols</code> 와 <code class="inline-code">LD_DEBUG=bindings</code> 가 — dynamic linker 의 모든 해결 과정을 출력한다. memcpy 가 어떻게 선택되는지 직접 확인 가능.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>SIMD 와 ifunc 의 조합은 — libc 가 사용자에게 보이지 않게 제공하는 마법이다.</p>
+<pre class="code-block lang-text"><code>[ifunc + SIMD 의 가치]
+
+  사용자 코드:
+    memcpy(dst, src, n);   ← 단순한 한 줄
+    
+  실제로는:
+    프로그램 시작 시: resolver 가 CPU 감지, 최적 구현 선택
+    호출 시:        SIMD 명령어로 한 cycle 에 16~64 바이트 처리
+    
+  결과:
+    같은 binary 가 옛 CPU 와 새 CPU 모두에서 최적
+    프로그래머는 plain C 만 쓰면 됨
+    글로벌 응용 프로그램 성능이 자동으로 향상</code></pre>
+<p>이 디자인이 — 영역 (c) 의 정점이다. 함수 호출의 의미는 그대로 두고, 그 내부 구현을 — runtime 에 가장 빠른 것으로 dispatch.</p>
+<h3 id="part-ii-의-마무리">Part II 의 마무리</h3>
+<p>Part II 에서 본 세 영역을 정리하면:</p>
+<pre class="code-block lang-text"><code>┌────────────────────────────────────────────────────────────────┐
+│ libc 의 3 영역 — 최종 정리                                         │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  (a) syscall wrapper       (10장)                                │
+│     얇은 변환 layer, syscall 명령어 호출                          │
+│     glibc 매크로 시스템 vs musl 의 직접 .c                        │
+│     자동 생성 (syscalls.list) vs 명시적                           │
+│                                                                 │
+│  (b) 추상화 층             (11장)                                 │
+│     state + buffer + caching + multi-syscall + lazy init        │
+│     stdio buffering, malloc, getaddrinfo, pthread_create        │
+│     사용자 호출과 syscall 의 1:1 관계를 깸                          │
+│                                                                 │
+│  (c) 순수 user-space + SIMD (12, 13장)                           │
+│     kernel 진입 없음, CPU 안에서 끝                                │
+│     string, math, sort, ctype                                   │
+│     SIMD + ifunc 으로 runtime 최적화                              │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘</code></pre>
+<p>각 영역이 — 다른 성능 특성, 다른 디자인 패턴, 다른 디버깅 도구를 요구한다. 응용 프로그래머가 이 셋을 구분하는 것이 — 성능 분석과 코드 이해의 첫걸음이다.</p>
+<p>다음 Part 부터는 — libc 의 더 깊은 내부를 본다. Part III 는 <code class="inline-code">_start</code> 부터 <code class="inline-code">main</code> 까지의 program startup. Part IV ~ VI 는 malloc, stdio, pthread 의 깊이.</p>
+<hr>
+<nav class="part-nav part-nav-bottom"><a href="part1.html" class="nav-link nav-prev" rel="prev"><span class="nav-arrow">←</span><span class="nav-meta"><span class="nav-label">Part I</span><span class="nav-title">기초</span></span></a><a href="index.html" class="nav-hub">libc 허브</a><a href="part3.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part III</span><span class="nav-title">_start 부터 main 까지</span></span><span class="nav-arrow">→</span></a></nav>
+</main>
+</div>
+<script src="../assets/script.js"></script>
+</body>
+</html>

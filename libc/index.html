@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libc 깊이 이해 — 7개 Part 학습 가이드</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle">🌙 Dark</button>
+<main class="content content-hub">
+<div class="hub-home"><a href="../index.html">← System Internals 홈</a></div>
+<div class="doc-header"><div class="doc-eyebrow">Technical Deep Dive</div><h1 class="doc-title">libc 깊이 이해</h1><div class="doc-subtitle">C 라이브러리부터 언어 runtime 까지 — 62 chapters, 7 Parts</div><div class="doc-meta"><span>30,359 lines</span><span>62 chapters</span><span>Verified against glibc master</span></div></div>
+
+<p>이 문서는 libc 의 내부 동작을 7개 Part 로 나누어 정리한 학습 가이드다. user-space 와 kernel-space 의 경계에서 시작해, libc 의 정체, program startup, 동적 메모리, 표준 입출력, 동시성, 그리고 마지막으로 dynamic linker 까지 — 각 주제를 공식 소스 (glibc master, musl, Linux kernel) 의 검증된 사실로 풀어간다.</p>
+<p>각 Part 는 독립된 HTML 문서다. 순서대로 읽어도 좋고, 관심 있는 주제부터 펼쳐도 된다.</p>
+
+<div class="part-cards"><a href="part1.html" class="part-card"><div class="part-card-label">Part I</div><div class="part-card-title">기초</div><div class="part-card-subtitle">user-space 와 kernel-space 의 경계</div><div class="part-card-meta">1~8장</div></a><a href="part2.html" class="part-card"><div class="part-card-label">Part II</div><div class="part-card-title">libc 의 정체</div><div class="part-card-subtitle">세 가지 일</div><div class="part-card-meta">9~13장</div></a><a href="part3.html" class="part-card"><div class="part-card-label">Part III</div><div class="part-card-title">_start 부터 main 까지</div><div class="part-card-subtitle">program startup 의 깊이</div><div class="part-card-meta">14~22장</div></a><a href="part4.html" class="part-card"><div class="part-card-label">Part IV</div><div class="part-card-title">malloc 의 깊이</div><div class="part-card-subtitle">동적 메모리의 정체</div><div class="part-card-meta">23~32장</div></a><a href="part5.html" class="part-card"><div class="part-card-label">Part V</div><div class="part-card-title">stdio 의 깊이</div><div class="part-card-subtitle">입출력의 정체</div><div class="part-card-meta">33~42장</div></a><a href="part6.html" class="part-card"><div class="part-card-label">Part VI</div><div class="part-card-title">pthread 의 깊이</div><div class="part-card-subtitle">동시성의 정체</div><div class="part-card-meta">43~52장</div></a><a href="part7.html" class="part-card"><div class="part-card-label">Part VII</div><div class="part-card-title">dynamic linker</div><div class="part-card-subtitle">ld-linux.so 의 깊이</div><div class="part-card-meta">53~62장</div></a></div>
+</main>
+<script src="../assets/script.js"></script>
+</body>
+</html>

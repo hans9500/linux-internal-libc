@@ -1,0 +1,1910 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libc 깊이 — Part I: 기초</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle">🌙 Dark</button>
+<div class="layout">
+<aside class="sidebar"><nav class="toc" aria-label="목차"><div class="sidebar-section sidebar-home"><a href="../index.html" class="home-link">← System Internals 홈</a></div><div class="sidebar-section"><div class="toc-title">Parts</div><ul class="part-nav-list"><li><a href="part1.html" class="part-nav-link part-nav-current"><span class="part-nav-num">Part I</span><span class="part-nav-text">기초</span></a></li><li><a href="part2.html" class="part-nav-link"><span class="part-nav-num">Part II</span><span class="part-nav-text">libc 의 정체</span></a></li><li><a href="part3.html" class="part-nav-link"><span class="part-nav-num">Part III</span><span class="part-nav-text">_start 부터 main 까지</span></a></li><li><a href="part4.html" class="part-nav-link"><span class="part-nav-num">Part IV</span><span class="part-nav-text">malloc 의 깊이</span></a></li><li><a href="part5.html" class="part-nav-link"><span class="part-nav-num">Part V</span><span class="part-nav-text">stdio 의 깊이</span></a></li><li><a href="part6.html" class="part-nav-link"><span class="part-nav-num">Part VI</span><span class="part-nav-text">pthread 의 깊이</span></a></li><li><a href="part7.html" class="part-nav-link"><span class="part-nav-num">Part VII</span><span class="part-nav-text">dynamic linker</span></a></li></ul></div><div class="sidebar-section"><div class="toc-title">Contents</div><ul class="toc-list"><li class="toc-sec"><a href="#1-libc-에-대한-흔한-오해"><span class="toc-num">1</span><span class="toc-label">libc 에 대한 흔한 오해</span></a></li><li class="toc-sec"><a href="#2-핵심-질문-정리"><span class="toc-num">2</span><span class="toc-label">핵심 질문 정리</span></a></li><li class="toc-sec"><a href="#3-cpu-의-권한-레벨-user-space-와-kernel-space-의-물리적-근거"><span class="toc-num">3</span><span class="toc-label">CPU 의 권한 레벨</span></a></li><li class="toc-sec"><a href="#4-syscall-명령어의-아키텍처별-구현"><span class="toc-num">4</span><span class="toc-label">syscall 명령어의 아키텍처별 구현</span></a></li><li class="toc-sec"><a href="#5-linux-의-syscall-abi-와-calling-convention"><span class="toc-num">5</span><span class="toc-label">Linux 의 syscall ABI …</span></a></li><li class="toc-sec"><a href="#6-syscall-table-의-정체와-등록-메커니즘"><span class="toc-num">6</span><span class="toc-label">syscall table 의 정체와 …</span></a></li><li class="toc-sec"><a href="#7-errno-의-thread-local-구현"><span class="toc-num">7</span><span class="toc-label">errno 의 thread-local…</span></a></li><li class="toc-sec"><a href="#8-vdso-kernel-이-user-space-에-직접-제공하는-코드"><span class="toc-num">8</span><span class="toc-label">vDSO</span></a></li></ul></div></nav></aside>
+<main class="content">
+<nav class="part-nav part-nav-top"><span class="nav-link nav-disabled"></span><a href="index.html" class="nav-hub">libc 허브</a><a href="part2.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part II</span><span class="nav-title">libc 의 정체</span></span><span class="nav-arrow">→</span></a></nav>
+<div class="doc-header"><div class="doc-eyebrow">libc internals</div><h1 class="doc-title">Part I — 기초</h1><div class="doc-subtitle">user-space 와 kernel-space 의 경계</div><div class="doc-meta"><span>1~8장</span><span>8 chapters</span><span>Verified against glibc master</span></div></div>
+<h1 class="stage-heading" id="part-i-기초-user-space-와-kernel-space-의-경계"><span class="stage-label">Part I</span><span class="stage-title">기초 — user-space 와 kernel-space 의 경계</span></h1>
+<p>이 Part 의 목적은 libc 를 이해하기 위한 기초 — <strong>user-space 와 kernel-space 의 경계가 정확히 무엇인가</strong> — 를 박는 것이다. libc 의 본질은 결국 &quot;이 경계를 어떻게 넘느냐&quot; 와 &quot;이 경계 안에서 무엇을 하느냐&quot; 이므로, 경계 자체를 먼저 정확히 이해해야 한다.</p>
+<p>CPU 의 권한 레벨부터 시작해서 syscall 명령어의 아키텍처별 구현, Linux 의 syscall ABI, errno 의 구현, vDSO 까지 다룬다. 이 Part 가 끝나면 &quot;user-space 코드 한 줄이 kernel 에 도달하기까지 무엇이 일어나는가&quot; 가 명료해진다.</p>
+<h2 class="section-heading" id="1-libc-에-대한-흔한-오해"><span class="section-num">1</span><span class="section-title">libc 에 대한 흔한 오해</span></h2>
+<p>libc 학습의 가장 큰 걸림돌은 단어 자체와 통념에서 오는 오해다. 본격적으로 들어가기 전에 흔한 오해들을 먼저 정리하면, 이후의 학습이 매우 매끄러워진다.</p>
+<h3 id="오해-1-모든-프로그램은-libc-를-호출한다">오해 1: &quot;모든 프로그램은 libc 를 호출한다&quot;</h3>
+<p>매우 흔한 오해다. 실제로는 다음과 같다.</p>
+<pre class="code-block lang-text"><code>┌────────────────────────────────────────────────────────────┐
+│ libc 를 거치는 언어 (대부분)                                  │
+├────────────────────────────────────────────────────────────┤
+│  C, C++, Python (CPython), Ruby, Perl, PHP, Java (JVM 내부)   │
+│  → 이들은 모두 libc 위에서 동작                                │
+└────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────┐
+│ libc 를 우회할 수 있는 언어 (예외)                             │
+├────────────────────────────────────────────────────────────┤
+│  Go, Rust (no_std), Zig                                     │
+│  → 자체 runtime 이 syscall 을 직접 호출                       │
+└────────────────────────────────────────────────────────────┘</code></pre>
+<p>특히 <strong>Go</strong> 는 Linux 에서 libc 를 거치지 않고 syscall 명령어를 직접 실행한다. Go 의 표준 라이브러리 <code class="inline-code">syscall</code> 패키지가 자체 어셈블리로 syscall 진입을 구현한다. 이는 Go 의 디자인 결정 중 하나로, libc 의존성을 제거해서 binary 가 self-contained 되도록 한 것이다.</p>
+<p>다만 같은 Go 라도 <code class="inline-code">cgo</code> 를 쓰는 순간 libc 가 끼어든다. 그리고 macOS / Windows 에서는 Go 도 OS 의 system 라이브러리 (libSystem, Win32) 를 거치므로, 진정한 syscall 우회는 Linux 에서만 가능하다.</p>
+<h3 id="오해-2-libc-는-c-의-libc-다">오해 2: &quot;libc++ 는 C++ 의 libc 다&quot;</h3>
+<p>이름이 만드는 오해다. <strong>libc++ 는 LLVM 의 C++ 표준 라이브러리 구현체</strong>이지, libc 의 C++ 판이 아니다.</p>
+<pre class="code-block lang-text"><code>용어 정리:
+
+  libc       = C 표준 라이브러리           (예: glibc, musl)
+               → printf, malloc, fork, ...
+
+  libstdc++  = C++ 표준 라이브러리 (GCC 구현)
+  libc++     = C++ 표준 라이브러리 (LLVM 구현)   ← 이름이 헷갈림
+  MSVC STL   = C++ 표준 라이브러리 (Microsoft 구현)
+               → std::vector, std::string, std::cout, ...</code></pre>
+<p><code class="inline-code">libc++</code> 라는 이름은 LLVM 진영이 GNU 의 <code class="inline-code">libstdc++</code> 와 구별하려고 골랐다. 좋은 이름은 아니었고, 두고두고 혼란의 원인이 된다. 그래서 macOS 개발자들이 &quot;내가 libc 의 C++ 버전을 쓰고 있구나&quot; 라고 잘못 이해하는 경우가 흔하다.</p>
+<p>더 중요한 사실은 — <strong>libc++ 도 결국 libc 위에서 동작한다.</strong> <code class="inline-code">std::vector</code> 가 메모리를 할당할 때 내부적으로 <code class="inline-code">operator new</code> 가 호출되고, 그게 결국 libc 의 <code class="inline-code">malloc</code> 을 부른다. <code class="inline-code">std::cout &lt;&lt; &quot;hello&quot;</code> 도 내부 buffer 관리 후 libc 의 <code class="inline-code">write()</code> (또는 그 비슷한 것) 를 호출한다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────┐
+│ C++ application                          │
+│   std::vector&lt;int&gt; v;                    │
+│   std::cout &lt;&lt; &quot;hello\n&quot;;                │
+└──────────────┬──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────┐
+│ C++ 표준 라이브러리 (libstdc++ or libc++)│
+│   std::vector, std::string, std::cout    │
+│   (이 안에서 결국 malloc, write 호출)     │
+└──────────────┬──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────┐
+│ libc (glibc or musl)                    │
+│   malloc, free, write, read, ...         │
+└──────────────┬──────────────────────────┘
+               │  syscall (CPU 명령어)
+═══════════════╪═════════════════════════════  user-space / kernel-space 경계
+               ▼
+╔═════════════════════════════════════════╗
+║ Linux kernel                             ║
+║   sys_write, sys_brk, sys_mmap, ...      ║
+╚═════════════════════════════════════════╝</code></pre>
+<p>즉 C++ 표준 라이브러리는 libc 를 <strong>대체</strong> 하는 것이 아니라 libc 위에 <strong>얹혀 있는</strong> 것이다. 두 layer 가 별개로 존재한다.</p>
+<h3 id="오해-3-libc-는-syscall-wrapper-의-모음일-뿐이다">오해 3: &quot;libc 는 syscall wrapper 의 모음일 뿐이다&quot;</h3>
+<p>이것도 흔한 오해다. 실제로 libc 코드의 라인 수 대부분은 syscall wrapper 가 아니다. libc 가 하는 일은 크게 세 가지로 나뉜다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────────────────────────────────────────────────────┐
+│ libc 의 세 가지 일                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  (a) syscall wrapper          (b) 추상화 층         (c) 순수 user-space│
+│  ────────────────              ─────────────         ───────────────│
+│   read()                       malloc()              strcpy()       │
+│   write()                      free()                strlen()       │
+│   open()                       printf()              memcpy()       │
+│   close()                      fopen()               sin(), cos()   │
+│   fork()                       pthread_create()      sprintf()      │
+│   ...                          pthread_mutex_*()     qsort()        │
+│                                getaddrinfo()         strftime()     │
+│                                ...                   ...            │
+│                                                                    │
+│   kernel 진입 1번             여러 syscall + 상태    kernel 호출 없음 │
+│                               + buffer 관리                         │
+└──────────────────────────────────────────────────────────────────┘</code></pre>
+<p>이 세 영역의 정확한 의미는 나중 Part 에서 깊이 다루겠지만, 미리 그림을 박아두면 학습 흐름이 매끄러워진다. 핵심은 — <strong>libc 가 wrapper 만이 아니라 그 위의 추상화가 더 큰 가치</strong>라는 점이다. <code class="inline-code">malloc</code> 은 단순한 syscall wrapper 가 아니라 <code class="inline-code">brk</code>/<code class="inline-code">mmap</code> syscall 위에 정교한 메모리 관리 시스템을 구축한 것이다. <code class="inline-code">stdio</code> 는 단순한 wrapper 가 아니라 <code class="inline-code">read</code>/<code class="inline-code">write</code> syscall 위에 buffering 시스템을 얹은 것이다.</p>
+<h3 id="오해-4-libc-와-kernel-의-함수는-같은-것이다">오해 4: &quot;libc 와 kernel 의 함수는 같은 것이다&quot;</h3>
+<p><code class="inline-code">man 2 read</code> 와 <code class="inline-code">man 3 read</code> 의 차이를 보면 명료해진다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ man section 의 의미                                          │
+├─────────────────────────────────────────────────────────────┤
+│  man 2  →  System call (kernel 함수)                          │
+│  man 3  →  C library function (libc 함수)                    │
+└─────────────────────────────────────────────────────────────┘
+
+예:
+  man 2 read   →  Linux kernel 의 sys_read 시스템 콜
+  man 3 fread  →  glibc 의 stdio 함수
+  man 3 printf →  glibc 의 가변 인자 출력 함수
+  man 2 write  →  Linux kernel 의 sys_write 시스템 콜</code></pre>
+<p><code class="inline-code">read()</code> 는 같은 이름이지만 두 곳에 존재한다 — kernel 의 <code class="inline-code">sys_read</code> 시스템 콜과 glibc 의 <code class="inline-code">read()</code> wrapper 함수. C 코드에서 <code class="inline-code">read(fd, buf, n)</code> 을 호출하면 glibc 의 wrapper 함수가 호출되고, 그것이 다시 <code class="inline-code">sys_read</code> 시스템 콜로 진입한다.</p>
+<h3 id="오해-5-go-runtime-은-java-의-jvm-같은-것이다">오해 5: &quot;Go runtime 은 Java 의 JVM 같은 것이다&quot;</h3>
+<p>둘 다 &quot;runtime&quot; 이라는 단어를 쓰지만 본질이 다르다.</p>
+<pre class="code-block lang-text"><code>[Java]                              [Go]
+                                    
+HelloWorld.class (bytecode)          ./main (native binary)
+       │                                   │
+       │  java HelloWorld                  │  실행
+       ▼                                   ▼
+┌─────────────────────┐              ┌─────────────────────┐
+│ JVM 프로세스          │              │ main 프로세스         │
+│ (별도의 거대한 binary)│              │ (단일 native binary) │
+│                      │              │                      │
+│ ┌──────────────────┐│              │ ┌──────────────────┐│
+│ │ class loader     ││              │ │ 사용자 Go 코드     ││
+│ │ bytecode interp  ││              │ │ (native code)     ││
+│ │ JIT compiler     ││              │ ├──────────────────┤│
+│ │ GC               ││              │ │ Go runtime        ││
+│ │ thread scheduler ││              │ │ (binary 안에 link)││
+│ └──────────────────┘│              │ │  - GC             ││
+│        │            │              │ │  - scheduler      ││
+│        │  syscall   │              │ │  - channels       ││
+│        ▼            │              │ │  - syscall direct ││
+└────────────────────┘              │ └──────────────────┘│
+                                    └─────────────────────┘
+
+JVM = 별도 프로세스로 실행되는 거대한    Go runtime = binary 안에
+       가상 머신                                 link 된 라이브러리</code></pre>
+<p>JVM 은 <strong>별도 프로세스로 실행되는 가상 머신</strong>이다. <code class="inline-code">java</code> 라는 거대한 실행파일이 있고, 사용자의 <code class="inline-code">.class</code> 파일을 데이터로 읽어서 해석한다. bytecode 는 CPU 가 직접 실행할 수 없고, JVM 안의 interpreter 또는 JIT 이 native code 로 번역해야 한다.</p>
+<p>Go runtime 은 <strong>사용자 binary 안에 함께 link 되는 라이브러리</strong>다. 별도의 &quot;Go 실행기&quot; 같은 프로그램이 없다. 사용자 Go 코드도, Go runtime 의 GC 와 scheduler 도 모두 컴파일 시점에 native machine code 로 번역되어 한 binary 안에 들어 있다.</p>
+<p>이 차이는 binary 크기, 시작 시간, 배포 방식 등 모든 면에서 큰 영향을 준다. Go 의 친척은 C/C++ 이지 Java 가 아니다.</p>
+<h3 id="오해들이-만드는-큰-그림-정리">오해들이 만드는 큰 그림 — 정리</h3>
+<p>다섯 오해를 정리하면 다음과 같은 잘못된 그림이 형성된다.</p>
+<pre class="code-block lang-text"><code>[잘못된 그림]
+모든 언어 ──▶ libc ──▶ kernel
+              ↑
+              libc++ (= libc 의 C++ 판)도 함께
+
+[실제 그림]
+                                  ┌──────────────────────────┐
+                                  │ Go runtime               │
+                                  │ (libc 우회)               │
+                                  └─────────┬────────────────┘
+                                            │
+C, C++, Python, Ruby, ...                   │
+  │                                         │
+  ├─▶ libc (glibc, musl)  ────┐             │
+  │                            │             │
+  ├─▶ libstdc++ or libc++ ─────┤             │
+  │   (C++ 표준 라이브러리)      │             │
+  │                            ▼             ▼
+  ├─▶ Java application ──▶ JVM ──▶ libc ──▶ kernel
+  │                       (별도 VM)
+  │
+  └─▶ Python application ──▶ CPython ──▶ libc ──▶ kernel
+                            (별도 인터프리터)</code></pre>
+<p>각 언어가 kernel 에 도달하는 길이 다르고, libc 의 위치도 다르다. 이 그림을 머릿속에 잘 박아두면 이후의 모든 학습이 매끄러워진다.</p>
+<p>이 다섯 오해를 정정하는 것이 이 문서 전체의 목적이라고 봐도 좋다. 다음 장부터 본격적인 정정 작업을 시작한다. 먼저 가장 기초인 user-space 와 kernel-space 의 경계부터 본다.</p>
+<h2 class="section-heading" id="2-핵심-질문-정리"><span class="section-num">2</span><span class="section-title">핵심 질문 정리</span></h2>
+<p>본격적인 학습에 들어가기 전에, 이 문서가 답하는 핵심 질문들을 미리 나열한다. 학습이 진행되면서 각 질문에 대한 답이 어떻게 채워지는지 의식하면 흐름이 명료해진다.</p>
+<h3 id="기초-user-space-와-kernel-space">기초 — user-space 와 kernel-space</h3>
+<p>1. CPU 의 권한 레벨이 정확히 무엇인가? (ring 0 / ring 3 의 의미) 2. user-space 코드가 kernel 함수를 직접 호출할 수 없는 이유는? 3. <code class="inline-code">syscall</code> 명령어가 정확히 무엇을 하는가? CPU 차원에서 어떤 일이 일어나는가? 4. x86_64 와 ARM64 의 syscall 메커니즘이 어떻게 다른가? 5. syscall 번호는 어디에 정의되어 있는가? (kernel 의 syscall table) 6. kernel 이 syscall 인자를 받는 규약은 일반 함수 호출과 어떻게 다른가? 7. errno 는 어떻게 thread-safe 하게 구현되어 있는가? 8. vDSO 가 정확히 무엇인가? 왜 필요한가?</p>
+<h3 id="libc-의-정체">libc 의 정체</h3>
+<p>9. libc 가 정확히 무엇을 제공하는가? (syscall wrapper / 추상화 / 순수 user-space) 10. glibc 와 musl 의 차이는 무엇인가? 11. <code class="inline-code">read()</code> 함수 한 줄이 실행되면 무엇이 일어나는가? 12. 왜 <code class="inline-code">printf(&quot;a&quot;)</code> 100 번 호출해도 syscall 은 1 번만 일어나는가? (stdio buffering) 13. <code class="inline-code">malloc</code> 한 번이 syscall 한 번을 의미하지 않는 이유는? 14. SIMD 가속된 libc 함수 (<code class="inline-code">memcpy</code>, <code class="inline-code">strlen</code>) 가 왜 일반 C 구현보다 빠른가?</p>
+<h3 id="libc-의-시작">libc 의 시작</h3>
+<p>15. 사용자가 <code class="inline-code">main()</code> 을 작성하지만, 실제 entry point 는 <code class="inline-code">_start</code> 인 이유는? 16. <code class="inline-code">__libc_start_main</code> 의 7 개 인자가 무엇이고 어디서 오는가? 17. <code class="inline-code">crt1.o</code>, <code class="inline-code">crti.o</code>, <code class="inline-code">crtn.o</code> 가 정확히 무엇인가? 18. C++ 의 전역 객체는 <code class="inline-code">main</code> 전에 어떻게 초기화되는가? 19. <code class="inline-code">__attribute__((constructor))</code> 함수는 정확히 언제 호출되는가? 20. <code class="inline-code">atexit</code> 으로 등록한 함수는 정확히 언제 호출되는가?</p>
+<h3 id="malloc-의-내부">malloc 의 내부</h3>
+<p>21. <code class="inline-code">malloc</code> 이 <code class="inline-code">brk</code> 와 <code class="inline-code">mmap</code> 을 어떻게 선택하는가? 22. malloc arena 가 무엇이고 왜 여러 개 필요한가? 23. tcache 가 어떻게 thread-local 캐싱을 하는가? 24. fastbin / smallbin / largebin 의 차이는? 25. <code class="inline-code">free</code> 한 메모리가 OS 에 즉시 반환되는가? 26. tcmalloc / jemalloc 가 glibc malloc 과 어떻게 다른가? 27. heap exploit 의 정확한 메커니즘은? glibc 가 어떻게 방어하는가?</p>
+<h3 id="stdio-의-정체">stdio 의 정체</h3>
+<p>28. <code class="inline-code">FILE *</code> 가 무엇을 가리키는가? master 정의는? 29. fully buffered / line buffered / unbuffered 의 차이는 어떻게 결정되는가? 30. <code class="inline-code">fread</code> 와 <code class="inline-code">read</code> 가 어떻게 다른가? 31. <code class="inline-code">printf(&quot;%d&quot;, x)</code> 가 내부에서 정확히 무엇을 하는가? 32. multi-thread 에서 stdio 가 어떻게 thread-safe 한가?</p>
+<h3 id="pthread-의-내부">pthread 의 내부</h3>
+<p>33. <code class="inline-code">pthread_create</code> 가 <code class="inline-code">clone(2)</code> 와 어떻게 다른가? 34. NPTL 이 무엇인가? LinuxThreads 와 어떻게 다른가? 35. mutex / condvar / rwlock 이 futex 위에 어떻게 구현되어 있는가? 36. TLS (Thread-Local Storage) 가 정확히 어떻게 동작하는가? 37. <code class="inline-code">pthread_atfork</code> 가 정확히 무엇을 하는가?</p>
+<h3 id="dynamic-linker">dynamic linker</h3>
+<p>38. <code class="inline-code">ld-linux.so</code> 가 무엇인가? 왜 그것도 libc 의 일부인가? 39. ELF 의 <code class="inline-code">PT_INTERP</code> segment 가 무엇인가? 40. PLT 와 GOT 가 정확히 무엇이고 왜 필요한가? 41. lazy binding 이 정확히 어떻게 동작하는가? 42. <code class="inline-code">LD_PRELOAD</code> 가 어떻게 동작해서 함수를 가로채는가?</p>
+<h3 id="다른-언어의-runtime">다른 언어의 runtime</h3>
+<p>43. Java 의 JVM 과 Go 의 runtime 이 본질적으로 어떻게 다른가? 44. Go 가 libc 를 우회하는 정확한 방법은? 그리고 왜? 45. Rust 의 standard library 가 libc 와 어떻게 협력하는가? 46. CPython 인터프리터가 libc 를 어떻게 사용하는가? 47. Node.js (V8) 가 libc 와 어떻게 관계 맺는가?</p>
+<p>이 질문들에 대한 답이 모두 채워지면, libc 와 user-space 의 정체가 완성된 그림으로 잡힌다. 그러면 어떤 언어의 어떤 라이브러리를 다루더라도 &quot;지금 어느 layer 의 일이 일어나고 있는가&quot; 를 명료히 알 수 있다.</p>
+<h2 class="section-heading" id="3-cpu-의-권한-레벨-user-space-와-kernel-space-의-물리적-근거"><span class="section-num">3</span><span class="section-title">CPU 의 권한 레벨 — user-space 와 kernel-space 의 물리적 근거</span></h2>
+<p>user-space 와 kernel-space 의 구분이 단순한 소프트웨어 관례가 아니라 <strong>CPU 의 물리적 메커니즘</strong> 위에 서 있다는 사실부터 박아야 한다. 이걸 모르면 &quot;왜 application 이 kernel 함수를 직접 못 부르는가&quot; 같은 질문에 정확한 답을 할 수 없다.</p>
+<h3 id="cpu-가-두-모드를-지원하는-이유">CPU 가 두 모드를 지원하는 이유</h3>
+<p>CPU 는 두 종류의 명령어를 가진다 — 누구나 실행할 수 있는 명령어와, 운영체제만 실행할 수 있는 명령어. 후자는 hardware 자원을 직접 건드리거나 보안에 큰 영향을 미치는 명령어들이다.</p>
+<pre class="code-block lang-text"><code>┌────────────────────────────────────────────────────────────┐
+│ 누구나 실행 가능 (user-space + kernel-space 모두)             │
+├────────────────────────────────────────────────────────────┤
+│  mov, add, sub, mul, div, ...    │ 일반 산술/메모리 명령      │
+│  jmp, call, ret, ...             │ 제어 흐름                 │
+│  push, pop, ...                  │ 스택                      │
+└────────────────────────────────────────────────────────────┘
+
+╔════════════════════════════════════════════════════════════╗
+║ 운영체제만 실행 가능 (kernel-space 전용)                       ║
+╠════════════════════════════════════════════════════════════╣
+║  in, out                         │ I/O port 직접 접근         ║
+║  hlt                             │ CPU halt (절전)            ║
+║  cli, sti                        │ interrupt 마스킹           ║
+║  lgdt, lidt                      │ descriptor table 로드      ║
+║  mov cr0, ...                    │ control register 변경      ║
+║  rdmsr, wrmsr                    │ Model-Specific Register   ║
+║  invlpg                          │ TLB flush                 ║
+║  swapgs                          │ GS register swap          ║
+║  ...                                                         ║
+╚════════════════════════════════════════════════════════════╝</code></pre>
+<p>user-space 코드가 이런 특권 명령어를 실행하려고 시도하면 — CPU 가 즉시 <strong>#GP (General Protection Fault)</strong> 예외를 발생시키고, kernel 의 예외 핸들러로 제어가 넘어간다. kernel 은 보통 <code class="inline-code">SIGSEGV</code> 를 그 프로세스에 보내서 죽인다.</p>
+<h3 id="x86-의-권한-레벨-ring-0-ring-3">x86 의 권한 레벨 — Ring 0 ~ Ring 3</h3>
+<p>x86 아키텍처는 네 단계의 권한 레벨 (privilege level) 을 지원한다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────────────────────────────────────────┐
+│ x86 의 권한 링 (Privilege Ring)                       │
+├──────────────────────────────────────────────────────┤
+│                                                       │
+│   ╔══════════════════════════════════════╗           │
+│   ║  Ring 0  (커널 모드, 최고 권한)         ║           │
+│   ║  - kernel, device driver              ║           │
+│   ║  - 모든 명령어 사용 가능                ║           │
+│   ║  ╔════════════════════════════════╗   ║           │
+│   ║  ║  Ring 1  (사용 안 함)            ║   ║           │
+│   ║  ║  ╔══════════════════════════╗  ║   ║           │
+│   ║  ║  ║  Ring 2  (사용 안 함)      ║  ║   ║           │
+│   ║  ║  ║  ┌────────────────────┐  ║  ║   ║           │
+│   ║  ║  ║  │ Ring 3 (사용자 모드)│  ║  ║   ║           │
+│   ║  ║  ║  │ - application      │  ║  ║   ║           │
+│   ║  ║  ║  │ - library          │  ║  ║   ║           │
+│   ║  ║  ║  │ - 일반 명령어만       │  ║  ║   ║           │
+│   ║  ║  ║  └────────────────────┘  ║  ║   ║           │
+│   ║  ║  ╚══════════════════════════╝  ║   ║           │
+│   ║  ╚════════════════════════════════╝   ║           │
+│   ╚══════════════════════════════════════╝           │
+│                                                       │
+│   안쪽 ring 일수록 권한 높음                            │
+└──────────────────────────────────────────────────────┘</code></pre>
+<p>x86 은 네 개의 ring 을 지원하지만, <strong>Linux (그리고 대부분의 현대 OS) 는 Ring 0 와 Ring 3 만 사용</strong>한다. 이유는 두 가지다.</p>
+<p>첫째, 다른 아키텍처 (ARM, RISC-V 등) 는 두 단계만 지원하므로, 두 단계만 쓰면 OS 코드가 아키텍처 독립적이다.</p>
+<p>둘째, 네 ring 의 복잡한 권한 분리는 microkernel 같은 실험적 OS 에서나 의미가 있고, monolithic kernel 인 Linux 에는 효용이 거의 없다. 또한 보안 측면에서도 네 ring 의 경계가 명료하지 않아 차라리 두 단계로 단순화하는 게 낫다.</p>
+<p>그래서 Linux 에서는:</p>
+<pre class="code-block lang-text"><code>Ring 0 → kernel 코드 (kernel-space)
+Ring 3 → application + library 코드 (user-space)
+Ring 1, 2 → 사용 안 함</code></pre>
+<h3 id="arm-의-권한-레벨-exception-level-el0-el3">ARM 의 권한 레벨 — Exception Level (EL0 ~ EL3)</h3>
+<p>ARMv8 (AArch64) 은 다른 용어를 쓴다. &quot;Ring&quot; 이 아니라 &quot;Exception Level (EL)&quot; 이다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────┐
+│ ARMv8 Exception Level                                │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│   EL3  →  Secure Monitor (TrustZone)                 │
+│           - 최고 권한, ARM TrustZone 의 monitor       │
+│                                                      │
+│   EL2  →  Hypervisor                                 │
+│           - 가상화 (KVM, Xen 등)                      │
+│                                                      │
+│   EL1  →  OS Kernel                                  │
+│           - Linux kernel                             │
+│                                                      │
+│   EL0  →  Application                                │
+│           - 사용자 코드, libc                          │
+│                                                      │
+│   숫자가 클수록 권한 높음                              │
+└─────────────────────────────────────────────────────┘</code></pre>
+<p>x86 과 달리 ARM 은 네 단계가 모두 실제로 사용된다. EL3 의 TrustZone 은 Android 의 keymaster, fingerprint 같은 보안 기능에 쓰이고, EL2 의 hypervisor 는 가상화에 쓰인다.</p>
+<p>일반 Linux application 의 관점에서는 그래도 두 단계만 의식하면 된다:</p>
+<pre class="code-block lang-text"><code>EL0 → application (user-space)
+EL1 → Linux kernel (kernel-space)</code></pre>
+<h3 id="x86-과-arm-비교">x86 과 ARM 비교</h3>
+<pre class="code-block lang-text"><code>┌─────────────┬──────────────┬──────────────┐
+│ 용도         │ x86          │ ARM          │
+├─────────────┼──────────────┼──────────────┤
+│ user-space  │ Ring 3       │ EL0          │
+│ kernel      │ Ring 0       │ EL1          │
+│ hypervisor  │ VMX root     │ EL2          │
+│ secure      │ SMM (별도)    │ EL3          │
+└─────────────┴──────────────┴──────────────┘</code></pre>
+<p>x86 의 VMX (Intel VT-x) 와 ARM 의 EL2 는 모두 가상화를 위한 추가 권한 모드다. x86 의 SMM (System Management Mode) 은 BIOS/UEFI 가 사용하는 매우 특수한 모드로, OS 도 모르게 실행된다.</p>
+<h3 id="권한-레벨이-메모리-보호와-결합되는-방식">권한 레벨이 메모리 보호와 결합되는 방식</h3>
+<p>권한 레벨만으로는 부족하다. user-space 코드가 kernel-space 의 메모리를 직접 읽으면 그것도 보안 문제다. CPU 는 메모리 보호를 <strong>page table</strong> 차원에서 처리한다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ x86_64 의 가상 메모리 layout (단순화)                          │
+├─────────────────────────────────────────────────────────────┤
+│ 0xFFFF_FFFF_FFFF_FFFF                                        │
+│        ▲                                                     │
+│        │  ╔═══════════════════════════════╗                  │
+│        │  ║ kernel-space                   ║                  │
+│        │  ║  - page table 의 U/S 비트 = 0  ║                  │
+│        │  ║  - kernel 만 접근 가능           ║                  │
+│        │  ║  - 모든 process 가 같은 영역 공유 ║                  │
+│        │  ╚═══════════════════════════════╝                  │
+│ 0xFFFF_8000_0000_0000  ← kernel/user 경계 (canonical hole)    │
+│ 0x0000_7FFF_FFFF_FFFF                                        │
+│        │  ┌───────────────────────────────┐                  │
+│        │  │ user-space                     │                  │
+│        │  │  - page table 의 U/S 비트 = 1  │                  │
+│        │  │  - user + kernel 모두 접근 가능 │                  │
+│        │  │  - process 마다 별개의 영역      │                  │
+│        │  └───────────────────────────────┘                  │
+│        ▼                                                     │
+│ 0x0000_0000_0000_0000                                        │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<p>각 page table entry 에는 <strong>U/S (User/Supervisor) 비트</strong>가 있다. 이 비트가 0 이면 Ring 0 에서만 접근 가능 (kernel-space), 1 이면 Ring 3 에서도 접근 가능 (user-space).</p>
+<p>만약 Ring 3 에서 U/S=0 인 페이지를 읽거나 쓰려고 하면 CPU 가 즉시 <strong>#PF (Page Fault)</strong> 예외를 발생시킨다. 결과는 보통 <code class="inline-code">SIGSEGV</code> 와 프로세스 종료.</p>
+<p>이 메커니즘 덕분에 — 같은 process 의 같은 가상 주소 공간 안에 user-space 코드와 kernel-space 코드가 공존하지만, user-space 코드는 절대 kernel-space 메모리를 읽거나 쓸 수 없다. 권한 레벨 (Ring) 과 메모리 보호 (page table) 가 함께 user-space 와 kernel-space 의 경계를 만든다.</p>
+<h3 id="ring-변경의-정확한-메커니즘-syscall-명령어">Ring 변경의 정확한 메커니즘 — syscall 명령어</h3>
+<p>user-space 가 kernel 함수를 호출하려면 Ring 3 → Ring 0 로 전환해야 한다. 이 전환은 <strong>CPU 의 특정 명령어</strong> 로만 가능하다.</p>
+<pre class="code-block lang-text"><code>[user-space, Ring 3]
+   │
+   │  syscall 명령어 실행
+   │  (다음 장에서 자세히 다룸)
+   ▼
+═══════════════════════════════════════════
+   │  CPU 가 자동으로:
+   │  1. 권한 레벨을 Ring 0 으로 전환
+   │  2. PC 를 미리 정한 진입점으로 점프
+   │  3. user-space 의 stack 을 저장
+   │  4. kernel-space 의 stack 으로 전환
+═══════════════════════════════════════════
+   │
+   ▼
+╔════════════════════════════════════╗
+║ kernel-space, Ring 0                ║
+║   entry_SYSCALL_64 라는 진입점       ║
+║   → sys_read, sys_write, ...       ║
+╚════════════════════════════════════╝</code></pre>
+<p>핵심은 — <strong>CPU 가 syscall 명령어를 본 순간 자동으로 권한을 올린다</strong>는 점이다. user-space 코드가 임의로 권한을 올릴 수 없고, 반드시 정해진 진입점 (kernel 이 미리 등록한) 으로만 들어갈 수 있다. 이게 보안의 핵심이다.</p>
+<p>만약 user-space 코드가 임의의 kernel 함수 주소로 점프할 수 있다면 — 권한 검사를 우회해서 kernel 안의 위험한 함수를 직접 호출할 수 있게 된다. 그래서 CPU 는 syscall 명령어를 통해서만 권한 전환을 허용하고, 진입점도 kernel 이 미리 정한 곳으로만 강제한다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>user-space 와 kernel-space 의 구분은 CPU 의 물리적 메커니즘 위에 서 있다.</p>
+<ul><li><strong>권한 레벨 (Ring/EL)</strong> — CPU 가 특권 명령어 실행을 제한</li><li><strong>메모리 보호 (U/S bit)</strong> — page table 이 메모리 접근을 제한</li><li><strong>권한 전환의 강제된 진입점</strong> — <code class="inline-code">syscall</code> 명령어만 권한을 올릴 수 있고, kernel 이 정한 진입점으로만 들어감</li></ul>
+<p>libc 의 모든 syscall wrapper 가 결국 이 메커니즘 위에서 동작한다. 다음 장에서 syscall 명령어가 정확히 무엇을 하는지 — 아키텍처별로 어떻게 다른지 — 본다.</p>
+<h2 class="section-heading" id="4-syscall-명령어의-아키텍처별-구현"><span class="section-num">4</span><span class="section-title">syscall 명령어의 아키텍처별 구현</span></h2>
+<p>앞 장에서 &quot;syscall 명령어가 user-space 와 kernel-space 사이의 권한 전환을 수행한다&quot; 는 사실까지 봤다. 이 장에서는 그 명령어가 정확히 어떻게 생겼는지 — 아키텍처마다 어떻게 다른지 — 본다. 같은 일을 하지만 mnemonic 과 register 규약이 다르므로, 각각을 따로 익혀야 한다.</p>
+<h3 id="한눈에-비교">한눈에 비교</h3>
+<pre class="code-block lang-text"><code>┌─────────────────┬──────────────────┬────────────────────────────────┐
+│ 아키텍처          │ syscall 명령어    │ syscall 번호 register           │
+├─────────────────┼──────────────────┼────────────────────────────────┤
+│ x86_64           │ syscall          │ rax                            │
+│ x86_32 (legacy)  │ int 0x80         │ eax                            │
+│ x86_32 (modern)  │ sysenter         │ eax (vDSO 경유 권장)            │
+│ ARM64 (AArch64)  │ svc #0           │ x8 (= w8)                      │
+│ ARM (EABI, 32)   │ svc 0x0          │ r7                             │
+│ ARM (OABI, 구식)  │ swi &lt;#&gt;          │ 명령어 immediate                 │
+│ RISC-V           │ ecall            │ a7                             │
+└─────────────────┴──────────────────┴────────────────────────────────┘</code></pre>
+<p>각 아키텍처를 차례로 본다.</p>
+<h3 id="x86_64-syscall-명령어">x86_64 — <code class="inline-code">syscall</code> 명령어</h3>
+<p>가장 중요한 케이스다. 현재 거의 모든 데스크탑/서버가 x86_64 이므로 일상적으로 만나는 syscall 메커니즘이다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - assembly]</span>
+<span class="hl-co">; write(1, &quot;hi\n&quot;, 3) 를 직접 호출하는 예</span>
+<span class="hl-kw">.section</span> <span class="hl-kw">.data</span>
+<span class="hl-fn">msg</span>: <span class="hl-kw">.ascii</span> <span class="hl-str">&quot;hi\n&quot;</span>
+
+<span class="hl-kw">.section</span> <span class="hl-kw">.text</span>
+<span class="hl-kw">.globl</span> _start
+<span class="hl-fn">_start</span>:
+    <span class="hl-kw">mov</span>  <span class="hl-num">$1</span>,    <span class="hl-kw">%rax</span>         <span class="hl-co">; syscall 번호 (SYS_write = 1)</span>
+    <span class="hl-kw">mov</span>  <span class="hl-num">$1</span>,    <span class="hl-kw">%rdi</span>         <span class="hl-co">; 1st arg: fd</span>
+    <span class="hl-kw">mov</span>  $msg,  <span class="hl-kw">%rsi</span>         <span class="hl-co">; 2nd arg: buf</span>
+    <span class="hl-kw">mov</span>  <span class="hl-num">$3</span>,    <span class="hl-kw">%rdx</span>         <span class="hl-co">; 3rd arg: count</span>
+    <span class="hl-kw">syscall</span>                  <span class="hl-co">; ← user-space / kernel-space 전환</span>
+
+    <span class="hl-kw">mov</span>  <span class="hl-num">$60</span>,   <span class="hl-kw">%rax</span>         <span class="hl-co">; syscall 번호 (SYS_exit = 60)</span>
+    <span class="hl-kw">mov</span>  <span class="hl-num">$0</span>,    <span class="hl-kw">%rdi</span>         <span class="hl-co">; exit code</span>
+    <span class="hl-kw">syscall</span></code></pre>
+<p><code class="inline-code">syscall</code> 명령어가 한 줄이지만 CPU 가 그 뒤에서 하는 일은 적지 않다. AMD64 의 명령어 정의 (Intel SDM Volume 2B 의 SYSCALL 항목) 에 따르면 다음을 수행한다.</p>
+<pre class="code-block lang-text"><code>[CPU 가 SYSCALL 명령어 실행 시 수행하는 일]
+
+1. RIP 의 다음 명령어 주소를 RCX 에 저장
+   (&quot;syscall 다음 명령어로 돌아갈 주소&quot; 를 보관)
+
+2. RFLAGS 를 R11 에 저장
+
+3. RIP 를 MSR_LSTAR 의 값으로 설정
+   (= kernel 이 미리 등록한 syscall 진입점 주소로 점프)
+
+4. CS, SS 를 MSR_STAR 의 값으로 설정
+   (= kernel-mode 의 segment selector)
+
+5. CPL (Current Privilege Level) 을 0 으로 변경
+   (= Ring 3 → Ring 0)
+
+6. RFLAGS 의 일부 비트를 MSR_SFMASK 에 따라 마스킹
+   (예: interrupt flag IF 를 클리어)</code></pre>
+<p>여기서 핵심은 <strong>MSR_LSTAR</strong> 이라는 Model-Specific Register 다. Linux kernel 이 boot 시점에 이 MSR 에 <code class="inline-code">entry_SYSCALL_64</code> 라는 함수의 주소를 등록해 둔다. 그래서 user-space 가 <code class="inline-code">syscall</code> 명령어를 실행하는 순간 — CPU 가 자동으로 그 주소로 점프하고 Ring 0 로 올라간다.</p>
+<p>master 의 진입점 정의는 <code class="inline-code">arch/x86/entry/entry_64.S</code> 에 있다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [kernel-space - arch/x86/entry/entry_64.S master, 단순화]</span>
+<span class="hl-fn">SYM_CODE_START</span>(entry_SYSCALL_64)
+    <span class="hl-fn">UNWIND_HINT_ENTRY</span>
+    <span class="hl-fn">ENDBR</span>
+    <span class="hl-fn">swapgs</span>                          <span class="hl-co">; user GS → kernel GS 전환</span>
+    <span class="hl-kw">movq</span>    <span class="hl-kw">%rsp</span>, PER_CPU_VAR(...) <span class="hl-co">; user stack 저장</span>
+    <span class="hl-kw">movq</span>    PER_CPU_VAR(cpu_current_top_of_stack), <span class="hl-kw">%rsp</span>  <span class="hl-co">; kernel stack 로드</span>
+
+    <span class="hl-fn">pushq</span>   $__USER_DS              <span class="hl-co">; SS</span>
+    <span class="hl-fn">pushq</span>   PER_CPU_VAR(cpu_tss_rw + TSS_sp2)  <span class="hl-co">; user RSP</span>
+    <span class="hl-fn">pushq</span>   <span class="hl-kw">%r11</span>                    <span class="hl-co">; RFLAGS (SYSCALL 가 저장한 것)</span>
+    <span class="hl-fn">pushq</span>   $__USER_CS              <span class="hl-co">; CS</span>
+    <span class="hl-fn">pushq</span>   <span class="hl-kw">%rcx</span>                    <span class="hl-co">; RIP (return address)</span>
+    <span class="hl-fn">pushq</span>   <span class="hl-kw">%rax</span>                    <span class="hl-co">; orig_rax (syscall 번호)</span>
+    <span class="hl-fn">PUSH_AND_CLEAR_REGS</span> rax=$-ENOSYS  <span class="hl-co">; 일반 레지스터들 저장</span>
+
+<span class="hl-co">    ; ... 이제 kernel 의 일반 C 코드로 진입 ...</span>
+    <span class="hl-kw">call</span>    do_syscall_64
+
+<span class="hl-co">    ; ... 복귀 처리 ...</span>
+    <span class="hl-fn">sysretq</span>                          <span class="hl-co">; kernel-space → user-space 복귀</span>
+<span class="hl-fn">SYM_CODE_END</span>(entry_SYSCALL_64)</code></pre>
+<p><code class="inline-code">swapgs</code> 명령어가 핵심이다. CPU 의 GS segment register 의 base 주소를 user GS 와 kernel GS 사이에서 교환한다. 이걸로 kernel 이 per-CPU 데이터에 접근할 수 있게 된다.</p>
+<p>user-space 에서 kernel-space 로 진입한 직후의 상태를 정리하면:</p>
+<pre class="code-block lang-text"><code>                      [user-space]               [kernel-space]
+─────────────────────────────────────────────────────────────
+권한 레벨               Ring 3                    Ring 0
+RIP                   syscall 다음 명령어          entry_SYSCALL_64
+RCX                   (user 데이터)               syscall return address (RIP 저장)
+R11                   (user 데이터)               saved RFLAGS
+GS base               user GS                    kernel GS (swapgs 후)
+스택                  user stack                 kernel stack (per-CPU)
+RAX                   syscall 번호                syscall 번호 (그대로)
+RDI/RSI/RDX/R10/R8/R9 syscall 인자               syscall 인자 (그대로)</code></pre>
+<p>흥미로운 점은 — <code class="inline-code">syscall</code> 명령어 자체는 <strong>레지스터를 자동으로 저장하지 않는다</strong>는 것이다. RCX 와 R11 에 RIP, RFLAGS 가 들어가는 게 전부고, 나머지 register 들은 user-space 의 값이 그대로 남아 있다. kernel 진입점 코드 (<code class="inline-code">PUSH_AND_CLEAR_REGS</code>) 가 명시적으로 push 해서 저장한다. 이 디자인이 syscall 을 매우 빠르게 만든다 — 필요한 register 만 저장하므로.</p>
+<h3 id="x86_32-int-0x80-과-sysenter">x86_32 — <code class="inline-code">int 0x80</code> 과 <code class="inline-code">sysenter</code></h3>
+<p>32-bit x86 에는 syscall 진입 방법이 세 가지 있다.</p>
+<h4><code class="inline-code">int 0x80</code> — 가장 오래된 방법</h4>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - x86_32 assembly]</span>
+<span class="hl-kw">mov</span>  <span class="hl-num">$4</span>,    <span class="hl-kw">%eax</span>     <span class="hl-co">; SYS_write (x86_32 에서는 4)</span>
+<span class="hl-kw">mov</span>  <span class="hl-num">$1</span>,    <span class="hl-kw">%ebx</span>     <span class="hl-co">; fd</span>
+<span class="hl-kw">mov</span>  $msg,  <span class="hl-kw">%ecx</span>     <span class="hl-co">; buf</span>
+<span class="hl-kw">mov</span>  <span class="hl-num">$3</span>,    <span class="hl-kw">%edx</span>     <span class="hl-co">; count</span>
+<span class="hl-kw">int</span>  <span class="hl-num">$0x80</span>           <span class="hl-co">; ← software interrupt</span></code></pre>
+<p><code class="inline-code">int 0x80</code> 은 software interrupt 다. CPU 가 interrupt descriptor table (IDT) 의 128번째 entry 를 보고 거기에 등록된 핸들러로 점프한다. kernel 이 IDT 의 0x80 번에 syscall 진입점을 등록해 두면 작동한다.</p>
+<p>문제는 — <strong>interrupt 메커니즘은 무겁다</strong>. CPU 가 IDT 를 조회하고, descriptor 의 권한을 검사하고, stack frame 을 만드는 등 많은 일을 한다. 그래서 모던 CPU 에서는 매우 느리다.</p>
+<h4><code class="inline-code">sysenter</code> — Intel 의 빠른 진입</h4>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - x86_32 assembly with sysenter]</span>
+<span class="hl-co">; (실제로는 vDSO 의 trampoline 을 거침)</span>
+<span class="hl-kw">call</span>  *<span class="hl-kw">%gs</span>:<span class="hl-num">0x10</span>      <span class="hl-co">; vDSO 의 __kernel_vsyscall 호출</span>
+<span class="hl-co">                     ; 그 안에서 sysenter</span></code></pre>
+<p>Intel 이 Pentium II 부터 도입한 빠른 진입 명령어. <code class="inline-code">int 0x80</code> 보다 훨씬 빠르지만, 복귀가 복잡해서 사용 시 주의가 필요하다 (sysenter 가 RIP 를 저장하지 않으므로 vDSO 의 trampoline 코드가 필요).</p>
+<h4><code class="inline-code">syscall</code> (32-bit) — AMD 의 빠른 진입</h4>
+<p>AMD 가 K6 에서 도입한 명령어. Intel 의 sysenter 와 비슷한 목적이지만 다른 구현. 모던 x86_64 CPU 는 32-bit 모드에서도 syscall 을 지원한다.</p>
+<pre class="code-block lang-text"><code>[x86_32 진입 방법 비교]
+
+  방법       │ 속도   │ 도입 시기      │ 복귀 RIP 저장
+  ───────────┼────────┼─────────────────┼──────────────
+  int 0x80   │ 느림   │ 매우 오래됨      │ 자동 (interrupt frame)
+  sysenter   │ 빠름   │ Pentium II      │ 명시적 (vDSO trampoline 필요)
+  syscall    │ 빠름   │ AMD K6          │ RCX 에 자동 저장</code></pre>
+<p>modern Linux 는 vDSO 안에 가장 빠른 진입 방법을 골라 등록한다. user-space code 는 그냥 <code class="inline-code">__kernel_vsyscall</code> 을 호출하면 되고, vDSO 가 알아서 적절한 명령어를 선택한다.</p>
+<h3 id="arm64-aarch64-svc-0">ARM64 (AArch64) — <code class="inline-code">svc #0</code></h3>
+<p>ARM64 는 <code class="inline-code">svc</code> (Supervisor Call) 명령어를 쓴다. x86 의 syscall 명령어와 같은 역할이다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - ARM64 assembly]</span>
+<span class="hl-co">; write(1, msg, 3) 호출</span>
+<span class="hl-kw">mov</span>  x0, <span class="hl-co">#1           ; 1st arg: fd</span>
+<span class="hl-fn">adr</span>  x1, msg          <span class="hl-co">; 2nd arg: buf 의 주소</span>
+<span class="hl-kw">mov</span>  x2, <span class="hl-co">#3           ; 3rd arg: count</span>
+<span class="hl-kw">mov</span>  x8, <span class="hl-co">#64          ; syscall 번호 (SYS_write = 64)</span>
+<span class="hl-fn">svc</span>  <span class="hl-co">#0               ; ← user-space / kernel-space 전환</span></code></pre>
+<p>ARM64 syscall ABI 의 핵심 사실 (master 와 man 7 syscall 에서 검증):</p>
+<pre class="code-block lang-text"><code>[ARM64 syscall convention]
+
+- 인자:        x0, x1, x2, x3, x4, x5  (최대 6개)
+- syscall 번호: x8 (또는 32-bit 인 w8)
+- 명령어:       svc #0
+- 반환값:       x0 (또는 x0, x1 두 값)
+- 에러:         x0 의 음수 값이 -errno (-4095 ~ -1)</code></pre>
+<p>x86_64 와의 가장 큰 차이는 — syscall 번호가 <strong>별도 register (x8)</strong> 에 들어간다는 점. x86_64 는 rax 를 syscall 번호와 반환값에 모두 쓰는데, ARM64 는 x8 (번호) 과 x0 (반환값) 을 분리한다. 이게 일반 함수 호출 규약과 syscall 규약을 더 일관성 있게 만든다 — x0~x7 이 일반 함수의 인자 register 와 같다.</p>
+<p><code class="inline-code">svc #0</code> 명령어가 발생시키는 일도 x86 의 syscall 과 비슷하지만 ARM 의 exception model 에 따른다.</p>
+<pre class="code-block lang-text"><code>[svc #0 가 발생시키는 일]
+
+1. EL0 → EL1 로 권한 상승
+
+2. PC 의 다음 명령어 주소를 ELR_EL1 (Exception Link Register) 에 저장
+   (&quot;svc 다음 명령어로 돌아갈 주소&quot;)
+
+3. PSTATE (Process State, x86 의 RFLAGS 와 비슷) 를 SPSR_EL1 에 저장
+
+4. PC 를 VBAR_EL1 + offset 으로 설정
+   (= kernel 이 등록한 exception vector table 의 적절한 entry)
+
+5. interrupt 마스킹 등 권한 모드 변환</code></pre>
+<p>master 의 ARM64 syscall 진입점은 <code class="inline-code">arch/arm64/kernel/entry.S</code> 에 있다. <code class="inline-code">el0t_64_sync_handler</code> → <code class="inline-code">el0_svc</code> → <code class="inline-code">do_el0_svc</code> 의 흐름.</p>
+<h3 id="arm-32-bit-eabi-svc-0x0">ARM (32-bit, EABI) — <code class="inline-code">svc 0x0</code></h3>
+<p>32-bit ARM 도 ARM64 와 비슷하지만 register 가 다르다. 그리고 syscall 번호가 들어가는 register 가 ARM EABI 에서는 <strong>r7</strong> 이다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - ARM EABI assembly]</span>
+<span class="hl-kw">mov</span>  r0, <span class="hl-co">#1           ; 1st arg: fd</span>
+<span class="hl-fn">ldr</span>  r1, =msg         <span class="hl-co">; 2nd arg: buf</span>
+<span class="hl-kw">mov</span>  r2, <span class="hl-co">#3           ; 3rd arg: count</span>
+<span class="hl-kw">mov</span>  r7, <span class="hl-co">#4           ; syscall 번호 (ARM 32-bit 의 write = 4)</span>
+<span class="hl-fn">svc</span>  <span class="hl-num">0x0</span>              <span class="hl-co">; ← user-space / kernel-space 전환</span></code></pre>
+<p>ARM EABI 의 syscall convention 을 정리하면:</p>
+<pre class="code-block lang-text"><code>[ARM EABI syscall convention - man 2 syscall 의 master 표]
+
+- 인자:        r0, r1, r2, r3, r4, r5, r6  (최대 7개)
+- syscall 번호: r7
+- 명령어:       svc 0x0
+- 반환값:       r0 (또는 r0, r1 두 값)
+- 에러:         r0 의 음수 값이 -errno</code></pre>
+<p>흥미로운 점은 — ARM EABI 의 syscall 은 일반 함수보다 <strong>인자를 더 많이 register 로 받을 수 있다</strong> 는 점이다. 일반 함수 호출 ABI 는 r0~r3 만 register 로 받고 그 이후는 stack 을 쓰지만, syscall 은 r0~r6 까지 (7 개) register 로 받는다. r7 은 syscall 번호 전용이라 인자로 쓸 수 없다.</p>
+<p>옛 OABI (Old ABI) 와 신 EABI 의 차이도 정리하면:</p>
+<pre class="code-block lang-text"><code>[OABI vs EABI on ARM 32-bit]
+
+OABI (구식):
+  syscall 번호를 명령어 immediate 로 인코딩
+  swi (SYS_write + 0x900000)
+  지원되지만 obsolete
+
+EABI (현재):
+  syscall 번호를 r7 에 로드
+  svc 0x0
+  master 가 권장</code></pre>
+<p>EABI 가 더 효율적이다 — kernel 이 명령어 자체를 디코딩할 필요 없이 r7 만 읽으면 된다.</p>
+<h3 id="risc-v-ecall">RISC-V — <code class="inline-code">ecall</code></h3>
+<p>RISC-V 는 <code class="inline-code">ecall</code> (Environment Call) 명령어를 쓴다. 매우 단순한 디자인이다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co"># [user-space - RISC-V assembly]</span>
+<span class="hl-fn">li</span>   a0, <span class="hl-num">1</span>            <span class="hl-co"># 1st arg: fd</span>
+<span class="hl-fn">la</span>   a1, msg          <span class="hl-co"># 2nd arg: buf</span>
+<span class="hl-fn">li</span>   a2, <span class="hl-num">3</span>            <span class="hl-co"># 3rd arg: count</span>
+<span class="hl-fn">li</span>   a7, <span class="hl-num">64</span>           <span class="hl-co"># syscall 번호 (write = 64)</span>
+<span class="hl-fn">ecall</span>                 <span class="hl-co"># ← user-space / kernel-space 전환</span></code></pre>
+<p>RISC-V 의 ABI 는 ARM64 와 매우 비슷하다.</p>
+<pre class="code-block lang-text"><code>[RISC-V syscall convention]
+
+- 인자:        a0, a1, a2, a3, a4, a5  (최대 6개)
+- syscall 번호: a7
+- 명령어:       ecall
+- 반환값:       a0
+- 에러:         a0 의 음수 값이 -errno</code></pre>
+<p>ARM64 처럼 syscall 번호와 반환값을 분리한 register 디자인이다. RISC-V 의 철학이 &quot;단순함&quot; 이라 — <code class="inline-code">ecall</code> 명령어가 하는 일도 극도로 적다. kernel 의 trap handler 가 거의 모든 일을 한다.</p>
+<pre class="code-block lang-text"><code>[ecall 이 발생시키는 일]
+
+1. 권한 모드 상승 (User → Supervisor)
+2. PC 를 stvec (Supervisor Trap Vector) 의 주소로 설정
+3. (그게 전부)
+
+레지스터 저장은 kernel 의 trap handler 가 명시적으로 한다</code></pre>
+<h3 id="아키텍처별-syscall-번호-비교">아키텍처별 syscall 번호 비교</h3>
+<p>또 하나 흥미로운 사실 — <strong>같은 syscall 이라도 아키텍처마다 번호가 다르다</strong>.</p>
+<pre class="code-block lang-text"><code>┌────────────┬──────────┬───────────┬─────────┬─────────────┐
+│ syscall    │ x86_64   │ x86_32    │ ARM64   │ ARM 32-bit  │
+├────────────┼──────────┼───────────┼─────────┼─────────────┤
+│ read       │ 0        │ 3         │ 63      │ 3           │
+│ write      │ 1        │ 4         │ 64      │ 4           │
+│ open       │ 2        │ 5         │ -       │ 5           │
+│ close      │ 3        │ 6         │ 57      │ 6           │
+│ exit       │ 60       │ 1         │ 93      │ 1           │
+│ fork       │ 57       │ 2         │ -       │ 2           │
+│ execve     │ 59       │ 11        │ 221     │ 11          │
+└────────────┴──────────┴───────────┴─────────┴─────────────┘</code></pre>
+<p><code class="inline-code">open</code> 과 <code class="inline-code">fork</code> 의 ARM64 칸이 비어 있는 이유는 — <strong>새로운 아키텍처에서는 일부 옛 syscall 이 제거</strong>되었기 때문이다. ARM64 는 비교적 늦게 도입된 아키텍처라 <code class="inline-code">open</code> 대신 <code class="inline-code">openat</code> 만 지원하고, <code class="inline-code">fork</code> 대신 <code class="inline-code">clone</code> 만 지원한다.</p>
+<p>이 번호들의 master 정의는 다음 파일들에 있다.</p>
+<pre class="code-block lang-text"><code>[Linux kernel syscall 번호 정의 위치 - master]
+
+x86_64:       arch/x86/entry/syscalls/syscall_64.tbl
+x86_32:       arch/x86/entry/syscalls/syscall_32.tbl
+ARM64:        include/uapi/asm-generic/unistd.h  (대부분)
+              + arch/arm64/include/asm/unistd.h
+ARM 32-bit:   arch/arm/tools/syscall.tbl
+RISC-V:       include/uapi/asm-generic/unistd.h</code></pre>
+<p>새 아키텍처 (ARM64, RISC-V) 들은 모두 <code class="inline-code">asm-generic/unistd.h</code> 의 표준 번호를 쓰도록 통일됐다. 옛 아키텍처 (x86_64, x86_32, ARM 32-bit) 는 각자의 historical 번호를 유지한다.</p>
+<h3 id="정리-모든-아키텍처의-공통-패턴">정리 — 모든 아키텍처의 공통 패턴</h3>
+<p>여러 아키텍처를 봤지만, 본질은 같다.</p>
+<pre class="code-block lang-text"><code>┌────────────────────────────────────────────────────────────┐
+│ 공통 패턴                                                    │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 인자들을 정해진 register 들에 로드                          │
+│  2. syscall 번호를 정해진 register 에 로드                     │
+│  3. 정해진 명령어 (syscall/svc/ecall/int) 실행               │
+│       ↓                                                     │
+│       CPU 가 자동으로 권한 상승 + 진입점 점프                   │
+│  4. kernel 의 진입 코드가 register 들을 저장하고 syscall handler │
+│     로 dispatch                                              │
+│  5. handler 가 일을 수행                                      │
+│  6. 결과를 정해진 register 에 넣고 user-space 로 복귀          │
+│                                                             │
+└────────────────────────────────────────────────────────────┘</code></pre>
+<p>아키텍처마다 register 이름과 명령어 mnemonic 이 다를 뿐, 메커니즘은 같다. 이걸 한 번 이해하면 어떤 아키텍처의 syscall 코드를 보더라도 빠르게 파악할 수 있다.</p>
+<p>다음 장에서는 syscall ABI 와 일반 함수 호출 ABI 의 차이를 정확히 본다. 이걸 명료히 해두면 libc wrapper 가 왜 그렇게 생겼는지 이해할 수 있다.</p>
+<h2 class="section-heading" id="5-linux-의-syscall-abi-와-calling-convention"><span class="section-num">5</span><span class="section-title">Linux 의 syscall ABI 와 calling convention</span></h2>
+<p>이 장에서는 user-space 와 kernel-space 사이의 ABI (Application Binary Interface) 를 깊이 본다. 특히 syscall ABI 가 일반 함수 호출 ABI 와 어떻게 다른지 — 그리고 왜 다른지 — 를 명료히 한다.</p>
+<h3 id="abi-란-무엇인가">ABI 란 무엇인가</h3>
+<p>ABI 는 두 binary 가 서로 호출할 때 따라야 할 약속이다. 같은 CPU 의 같은 명령어 셋이라도, 인자를 어디에 넣고, 반환값을 어디에서 받고, 어떤 register 를 보존해야 하는지가 약속되어 있어야 호출이 작동한다.</p>
+<pre class="code-block lang-text"><code>┌───────────────────────────────────────────────────────────┐
+│ ABI 가 정의하는 것들                                          │
+├───────────────────────────────────────────────────────────┤
+│  - 인자 전달 방법 (어떤 register 에, 어떤 순서로)              │
+│  - 반환값 전달 방법                                           │
+│  - register 보존 규칙 (caller-saved vs callee-saved)         │
+│  - stack 정렬 요구사항                                        │
+│  - 데이터 타입의 크기 (int, long, pointer)                    │
+│  - 구조체의 메모리 레이아웃                                    │
+│  - signal handler 호출 규약                                  │
+│  - 시스템 호출 진입 방법                                       │
+└───────────────────────────────────────────────────────────┘</code></pre>
+<p>Linux 의 ABI 표준 문서는 <strong>System V ABI</strong> 다. 그 중 x86_64 부분은 &quot;System V Application Binary Interface, AMD64 Architecture Processor Supplement&quot; 라는 별도 문서로 관리된다. 이 문서는 LLVM 의 GitHub repository 에서 master 로 유지된다.</p>
+<h3 id="일반-함수-호출-abi-vs-syscall-abi">일반 함수 호출 ABI vs syscall ABI</h3>
+<p>x86_64 에서 일반 함수 호출과 syscall 의 ABI 가 어떻게 다른지부터 본다. System V AMD64 ABI 의 Section 3.2.3 (일반 함수) 과 Section A.2.1 (Linux syscall) 을 직접 인용한다.</p>
+<pre class="code-block lang-text"><code>┌──────────────────┬────────────────────┬────────────────────┐
+│ 항목              │ 일반 함수 호출       │ Linux syscall      │
+├──────────────────┼────────────────────┼────────────────────┤
+│ 인자 register     │ rdi, rsi, rdx,     │ rdi, rsi, rdx,     │
+│                  │ rcx, r8, r9        │ r10, r8, r9        │
+│                  │ (rcx = 4번째 arg)   │ (r10 = 4번째 arg)   │
+│                  │                    │                    │
+│ 추가 인자         │ stack 에 push      │ 사용 불가 (최대 6개)  │
+│                  │                    │                    │
+│ syscall 번호      │ N/A                │ rax                │
+│                  │                    │                    │
+│ 반환값            │ rax (1st),         │ rax                │
+│                  │ rdx (2nd)          │                    │
+│                  │                    │                    │
+│ 에러 표시         │ 함수마다 다름       │ rax 가 -4095 ~ -1   │
+│                  │                    │ 범위면 -errno       │
+│                  │                    │                    │
+│ Clobbered        │ rax, rcx, rdx,     │ rcx, r11           │
+│ (보존되지 않음)    │ rsi, rdi, r8-r11   │ + 인자 register들    │
+│                  │                    │ (syscall 자체가     │
+│                  │                    │ rcx, r11 망가뜨림)   │
+│                  │                    │                    │
+│ Stack 정렬        │ 16-byte           │ 무관                │
+│                  │ (call 직전)        │ (syscall 은 stack   │
+│                  │                    │ 사용 안 함)         │
+└──────────────────┴────────────────────┴────────────────────┘</code></pre>
+<p>가장 중요한 차이는 — **4번째 인자가 <code class="inline-code">rcx</code> 가 아니라 <code class="inline-code">r10</code>** 이라는 점이다. 이 차이가 존재하는 이유는 흥미로운 hardware 사실에서 온다.</p>
+<h3 id="왜-syscall-abi-가-r10-을-쓰는가">왜 syscall ABI 가 r10 을 쓰는가</h3>
+<p><code class="inline-code">syscall</code> 명령어가 실행되면 <strong>CPU 가 자동으로 RCX 를 덮어쓴다</strong> — 반환 주소 (syscall 다음 명령어의 RIP) 가 RCX 에 저장된다. 그러므로 RCX 에 user 가 미리 넣은 값은 사라진다.</p>
+<pre class="code-block lang-text"><code>[syscall 명령어 실행 시점]
+
+  user-space:
+    rdi = arg1                    │
+    rsi = arg2                    │
+    rdx = arg3                    │
+    rcx = arg4 (의도했던 4번째 인자) │   ← 이게 망가짐!
+    r8  = arg5                    │
+    r9  = arg6                    │
+    rax = syscall 번호             │
+       │
+       │ syscall 실행
+       ▼
+  CPU 가 자동으로:
+    RCX ← RIP (return address)    ← user 의 arg4 가 RCX 에서 지워짐
+    R11 ← RFLAGS
+       │
+       ▼
+  kernel-space:
+    rcx = (이미 망가짐, syscall return address)
+    arg4 가 어디서 와야 하나?</code></pre>
+<p>이 hardware 제약 때문에 — Linux syscall ABI 는 <strong>arg4 를 r10 에</strong> 넣도록 정했다. user-space 의 libc wrapper 가 syscall 호출 직전에 rcx 에 있던 값을 r10 으로 옮긴다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - glibc 의 syscall wrapper 단순화]</span>
+<span class="hl-co">; read(fd, buf, count) 을 호출할 때 인자 처리</span>
+
+<span class="hl-co">; C 함수 호출 ABI 로 들어옴 (rdi, rsi, rdx 에 인자)</span>
+<span class="hl-co">; ↓</span>
+<span class="hl-co">; syscall 직전:</span>
+<span class="hl-kw">mov</span>  <span class="hl-kw">%rcx</span>, <span class="hl-kw">%r10</span>       <span class="hl-co">; arg4 가 있을 자리를 r10 으로 옮김</span>
+<span class="hl-co">                      ; (read 는 3개 인자라 사실 의미 없지만, 4+개 인자 syscall 의 경우)</span>
+<span class="hl-kw">mov</span>  <span class="hl-num">$0</span>,   <span class="hl-kw">%rax</span>       <span class="hl-co">; SYS_read = 0</span>
+<span class="hl-kw">syscall</span>               <span class="hl-co">; ← kernel 진입</span></code></pre>
+<p>System V AMD64 ABI Appendix A.2 (AMD64 Linux Kernel Conventions) 의 본문은 다음과 같다 (master 인용):</p>
+<pre class="code-block lang-text"><code>[System V AMD64 ABI, Section A.2.1]
+
+The Linux AMD64 kernel uses internally the same calling conventions as
+user-level applications. The interface between the C library and the
+Linux kernel is the same as for the user-level applications with the
+following differences:
+
+1. User-level applications use as integer registers for passing the
+   sequence %rdi, %rsi, %rdx, %rcx, %r8 and %r9. The kernel interface
+   uses %rdi, %rsi, %rdx, %r10, %r8 and %r9.
+
+2. A system-call is done via the syscall instruction. The kernel
+   destroys registers %rcx and %r11.
+
+3. The number of the syscall has to be passed in register %rax.
+
+4. System-calls are limited to six arguments, no argument is passed
+   directly on the stack.
+
+5. Returning from the syscall, register %rax contains the result of
+   the system-call. A value in the range between -4095 and -1 indicates
+   an error, it is -errno.
+
+6. Only values of class INTEGER or class MEMORY are passed to the kernel.</code></pre>
+<p>이 6 가지 사실이 x86_64 Linux syscall 의 핵심이다. 외워둘 만하다.</p>
+<h3 id="errno-의-인코딩-4095-1">errno 의 인코딩 — -4095 ~ -1</h3>
+<p>위 ABI 의 5번 사실이 매우 중요하다. <strong>kernel 은 에러를 음수로 반환</strong>한다. 그것도 -4095 ~ -1 사이의 정수만 에러로 취급한다.</p>
+<pre class="code-block lang-text"><code>[rax 의 반환값 의미]
+
+  값의 범위                  │ 의미
+  ──────────────────────────┼──────────────────────────────
+  -4095 ~ -1                │ 에러 (-errno)
+                            │   예: -ENOENT = -2, -EINVAL = -22
+                            │
+  -4096 ~ -2^63             │ 일반 음수 반환값
+                            │   예: lseek 의 SEEK_END 후 음수 offset
+                            │
+  0                         │ 보통 성공 (또는 0 반환)
+                            │
+  1 ~ 2^63 - 1              │ 일반 양수 반환값
+                            │   예: read 가 읽은 바이트 수
+                            │   예: file descriptor</code></pre>
+<p>-4095 라는 마법의 숫자는 — <strong>Linux 의 모든 errno 값이 1~4095 범위 안에 들어간다</strong>는 사실에서 온다. <code class="inline-code">include/uapi/asm-generic/errno-base.h</code> 와 <code class="inline-code">errno.h</code> 의 모든 정의를 보면 가장 큰 값도 4095 를 넘지 않는다.</p>
+<p>glibc wrapper 가 이 인코딩을 풀어준다:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc syscall wrapper 의 일반 패턴]</span>
+<span class="hl-kw">ssize_t</span> <span class="hl-fn">read</span>(<span class="hl-kw">int</span> fd, <span class="hl-kw">void</span> *buf, <span class="hl-kw">size_t</span> count) {
+    <span class="hl-kw">long</span> ret;
+    <span class="hl-kw">asm</span> <span class="hl-kw">volatile</span> (
+        <span class="hl-str">&quot;syscall&quot;</span>
+        : <span class="hl-str">&quot;=a&quot;</span> (ret)
+        : <span class="hl-str">&quot;0&quot;</span> (SYS_read), <span class="hl-str">&quot;D&quot;</span> (fd), <span class="hl-str">&quot;S&quot;</span> (buf), <span class="hl-str">&quot;d&quot;</span> (count)
+        : <span class="hl-str">&quot;rcx&quot;</span>, <span class="hl-str">&quot;r11&quot;</span>, <span class="hl-str">&quot;memory&quot;</span>
+    );
+
+    <span class="hl-co">// 음수가 errno 범위면 errno 설정하고 -1 반환</span>
+    <span class="hl-kw">if</span> (ret &lt; <span class="hl-num">0</span> &amp;&amp; ret &gt;= -<span class="hl-num">4095</span>) {
+        errno = -ret;       <span class="hl-co">// 음수를 양수 errno 로</span>
+        <span class="hl-kw">return</span> -<span class="hl-num">1</span>;
+    }
+    <span class="hl-kw">return</span> ret;
+}</code></pre>
+<p>이 처리가 glibc wrapper 의 주요한 일 중 하나다. 사용자가 직접 <code class="inline-code">syscall(2)</code> 함수로 호출하면 이런 errno 변환을 직접 해야 한다.</p>
+<h3 id="다른-아키텍처의-abi-차이">다른 아키텍처의 ABI 차이</h3>
+<p>ARM64, ARM 32-bit, RISC-V 의 syscall ABI 도 유사한 디자인이지만 register 가 다르다.</p>
+<pre class="code-block lang-text"><code>┌──────────┬─────────────────────────┬──────────┬─────────────────┐
+│ 아키텍처   │ 인자 register             │ syscall # │ 일반 함수와 차이  │
+├──────────┼─────────────────────────┼──────────┼─────────────────┤
+│ x86_64   │ rdi rsi rdx r10 r8 r9   │ rax      │ rcx → r10        │
+│ ARM64    │ x0 x1 x2 x3 x4 x5       │ x8 (w8)  │ 일반 함수와 동일   │
+│          │ (일반 함수도 x0~x7 사용)  │          │ (x8 추가됨)       │
+│ ARM 32   │ r0 r1 r2 r3 r4 r5 r6    │ r7       │ 인자가 7 개 (r6 까지) │
+│          │ (일반 함수는 r0~r3 만)   │          │ r7 은 syscall 번호    │
+│ RISC-V   │ a0 a1 a2 a3 a4 a5       │ a7       │ 일반 함수와 동일   │
+│          │ (일반 함수도 a0~a7 사용) │          │ (a7 syscall 용)   │
+└──────────┴─────────────────────────┴──────────┴─────────────────┘</code></pre>
+<p>ARM64, RISC-V 같은 새 아키텍처는 일반 함수 호출 ABI 와 syscall ABI 를 가능한 한 일치시키는 디자인이다. x86_64 의 r10 우회 같은 hack 이 없다. 더 깨끗한 디자인이지만, x86_64 는 hardware 제약 때문에 어쩔 수 없다.</p>
+<h3 id="일반-함수-호출-abi-자체도-살펴두기">일반 함수 호출 ABI 자체도 살펴두기</h3>
+<p>비교를 명료히 하기 위해 일반 함수 호출 ABI 도 잠시 본다. System V AMD64 ABI 의 일반 함수 호출 규약은 다음과 같다.</p>
+<pre class="code-block lang-text"><code>[System V AMD64 ABI - 일반 함수 호출]
+
+인자 (integer/pointer):
+  arg1: rdi    arg4: rcx
+  arg2: rsi    arg5: r8
+  arg3: rdx    arg6: r9
+  arg7+: stack (right-to-left push)
+
+인자 (floating point):
+  arg1: xmm0    arg5: xmm4
+  arg2: xmm1    arg6: xmm5
+  arg3: xmm2    arg7: xmm6
+  arg4: xmm3    arg8: xmm7
+  arg9+: stack
+
+반환값:
+  integer: rax (1st), rdx (2nd)
+  floating: xmm0 (1st), xmm1 (2nd)
+  large struct: 호출자가 메모리 할당, 주소를 rdi 로 전달
+
+Callee-saved (호출되는 함수가 보존):
+  rbx, rbp, rsp, r12, r13, r14, r15
+
+Caller-saved (호출하는 측이 보존):
+  rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+  xmm0~xmm15</code></pre>
+<p>이 규약이 syscall 규약과 명료히 다르다는 게 핵심이다. 같은 x86_64 CPU 위에서 두 ABI 가 공존하고, libc 가 그 사이의 변환을 담당한다.</p>
+<pre class="code-block lang-text"><code>[user-space C 코드]
+read(fd, buf, count);     ← System V AMD64 ABI 로 호출됨
+                              인자: rdi, rsi, rdx
+       │
+       ▼
+[glibc 의 read() wrapper - assembly]
+   변환:
+     rdi → rdi (그대로)
+     rsi → rsi (그대로)
+     rdx → rdx (그대로)
+     rax ← SYS_read 번호
+   syscall                ← Linux syscall ABI 로 진입
+       │
+═══════╪═══════════════════════════════════════════════════
+       ▼
+[kernel - sys_read]
+   ABI: Linux syscall ABI
+     arg1 = rdi (fd)
+     arg2 = rsi (buf)
+     arg3 = rdx (count)
+   실행 후 결과를 rax 에</code></pre>
+<p>read 의 경우 인자가 3개라 rcx/r10 변환이 불필요해서 wrapper 가 더 단순하다. 4개 이상 인자를 받는 syscall (예: <code class="inline-code">pwrite(fd, buf, count, offset)</code>) 의 wrapper 만 r10 변환을 한다.</p>
+<h3 id="libc-wrapper-가-하는-일-정리">libc wrapper 가 하는 일 — 정리</h3>
+<p>지금까지의 사실들을 모으면 — libc 의 syscall wrapper 가 무엇을 하는지가 명료해진다.</p>
+<pre class="code-block lang-text"><code>┌────────────────────────────────────────────────────────────┐
+│ libc syscall wrapper 의 일                                   │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. C 함수 호출 ABI 로 인자 받기                              │
+│     - rdi, rsi, rdx, rcx, r8, r9 에 인자 도착                │
+│                                                             │
+│  2. syscall ABI 로 인자 정리                                 │
+│     - x86_64: rcx → r10 로 옮기기 (4+ 인자 syscall 의 경우)   │
+│     - rax 에 syscall 번호 로드                                │
+│                                                             │
+│  3. syscall 명령어 실행                                       │
+│     - CPU 가 자동으로 권한 상승 + 진입점 점프                  │
+│                                                             │
+│  4. kernel 작업 완료 후 복귀                                   │
+│                                                             │
+│  5. 반환값 확인                                                │
+│     - rax 가 -4095 ~ -1 면 errno 설정 + -1 반환               │
+│     - 그렇지 않으면 rax 값을 그대로 C 함수 반환값으로            │
+│                                                             │
+└────────────────────────────────────────────────────────────┘</code></pre>
+<p>이 일들이 매우 간단해서 — 최적화된 wrapper 는 보통 10~20 줄의 어셈블리로 끝난다. 그래서 libc wrapper 의 overhead 는 극도로 작다 (보통 nanosecond 단위). syscall 자체의 비용 (kernel 진입/복귀) 이 wrapper 비용보다 압도적으로 크다.</p>
+<p>다음 장에서는 kernel 쪽 — syscall table 이 어떻게 등록되어 있고 진입점이 어떻게 dispatch 하는지 — 를 본다.</p>
+<h2 class="section-heading" id="6-syscall-table-의-정체와-등록-메커니즘"><span class="section-num">6</span><span class="section-title">syscall table 의 정체와 등록 메커니즘</span></h2>
+<p>이 장은 user-space 에서 출발한 시선이 처음으로 kernel-space 안쪽을 들여다보는 장이다. user-space 의 <code class="inline-code">syscall</code> 명령어 한 줄이 kernel 의 어떤 함수와 어떻게 매칭되는지, 그 표(table) 의 정체와 만들어지는 과정을 본다.</p>
+<h3 id="dispatch-의-큰-그림">dispatch 의 큰 그림</h3>
+<p>먼저 큰 그림부터.</p>
+<pre class="code-block lang-text"><code>[user-space]                              [kernel-space]
+                                                      
+   syscall 명령어                                       
+   rax = 1 (write)                                    
+       │                                              
+       │  CPU 가 자동으로 권한 상승                       
+═══════╪═══════════════════════════════════════════════
+       ▼                                              
+                                ╔═════════════════════╗
+                                ║ entry_SYSCALL_64     ║
+                                ║ (어셈블리)           ║
+                                ║  - 레지스터 저장       ║
+                                ║  - kernel stack 전환  ║
+                                ║  - pt_regs 구성       ║
+                                ╚══════════╤══════════╝
+                                           │
+                                           ▼
+                                ╔═════════════════════╗
+                                ║ do_syscall_64 (C)    ║
+                                ║  - syscall 번호 검증   ║
+                                ║  - x64_sys_call dispatch║
+                                ╚══════════╤══════════╝
+                                           │  switch (nr)
+                                           ▼
+                                ╔═════════════════════╗
+                                ║ __x64_sys_write       ║
+                                ║ (SYSCALL_DEFINE 매크로 ║
+                                ║  로 생성됨)            ║
+                                ╚══════════╤══════════╝
+                                           │
+                                           ▼
+                                ╔═════════════════════╗
+                                ║ ksys_write            ║
+                                ║ (실제 구현)            ║
+                                ╚═════════════════════╝</code></pre>
+<p>이 흐름을 차례로 본다. 먼저 syscall 번호와 함수 이름의 매칭이 어디서 정의되어 있는지부터.</p>
+<h3 id="syscall-tbl-번호와-이름의-master-정의">syscall.tbl — 번호와 이름의 master 정의</h3>
+<p>x86_64 의 모든 syscall 은 한 텍스트 파일에 표 형태로 정의되어 있다 — <code class="inline-code">arch/x86/entry/syscalls/syscall_64.tbl</code> (Linux master).</p>
+<pre class="code-block lang-text"><code># [kernel-space - arch/x86/entry/syscalls/syscall_64.tbl 일부]
+# 형식: &lt;번호&gt;  &lt;abi&gt;  &lt;이름&gt;      &lt;entry point&gt;
+0       common  read        sys_read
+1       common  write       sys_write
+2       common  open        sys_open
+3       common  close       sys_close
+4       common  stat        sys_newstat
+5       common  fstat       sys_newfstat
+...
+9       common  mmap        sys_mmap
+10      common  mprotect    sys_mprotect
+11      common  munmap      sys_munmap
+12      common  brk         sys_brk
+...
+57      common  fork        sys_fork
+58      common  vfork       sys_vfork
+59      common  execve      sys_execve
+60      common  exit        sys_exit
+...</code></pre>
+<p>이 표가 syscall 번호와 kernel 함수 이름을 매핑한다. 형식의 의미:</p>
+<pre class="code-block lang-text"><code>[syscall.tbl 형식]
+
+&lt;번호&gt;      → user-space 가 rax 에 넣어야 할 값
+&lt;abi&gt;      → &quot;common&quot; (모든 ABI), &quot;64&quot; (64-bit 만), &quot;x32&quot; (x32 ABI 만)
+&lt;이름&gt;      → man page 의 이름, libc wrapper 이름
+&lt;entry point&gt; → kernel 안의 실제 함수 이름</code></pre>
+<p>이 표는 빌드 타임에 코드 생성에 쓰인다. 매번 새 syscall 이 추가될 때마다 사람이 직접 표에 한 줄을 추가하고, 빌드 시스템이 자동으로 매크로와 dispatch 코드를 생성한다.</p>
+<p>다른 아키텍처도 비슷한 표를 가진다:</p>
+<pre class="code-block lang-text"><code>[아키텍처별 syscall.tbl 위치 - Linux master]
+
+x86_64:       arch/x86/entry/syscalls/syscall_64.tbl
+x86_32:       arch/x86/entry/syscalls/syscall_32.tbl
+ARM 32-bit:   arch/arm/tools/syscall.tbl
+s390:         arch/s390/kernel/syscalls/syscall.tbl
+mips:         arch/mips/kernel/syscalls/syscall_*.tbl
+alpha:        arch/alpha/kernel/syscalls/syscall.tbl
+
+ARM64 / RISC-V / 새 아키텍처:
+              include/uapi/asm-generic/unistd.h  (공통)
+              + 아키텍처별 추가 정의</code></pre>
+<p>새 아키텍처 (ARM64, RISC-V) 들은 공통 <code class="inline-code">unistd.h</code> 의 표준 번호를 그대로 따른다. 옛 아키텍처들은 historical 한 번호를 유지하기 위해 자체 표를 가진다.</p>
+<h3 id="syscall_define-매크로-entry-point-의-본체">SYSCALL_DEFINE 매크로 — entry point 의 본체</h3>
+<p>syscall 의 본체는 어떻게 정의될까. master 의 어디를 보면 <code class="inline-code">sys_write</code> 의 코드를 찾을 수 있을까. 답은 — <code class="inline-code">SYSCALL_DEFINE</code> 매크로다. master 의 <code class="inline-code">fs/read_write.c</code> 를 보자.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - fs/read_write.c master, 단순화]</span>
+<span class="hl-fn">SYSCALL_DEFINE3</span>(write, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span>, fd, <span class="hl-kw">const</span> <span class="hl-kw">char</span> __user *, buf, <span class="hl-kw">size_t</span>, count)
+{
+    <span class="hl-kw">return</span> <span class="hl-fn">ksys_write</span>(fd, buf, count);
+}</code></pre>
+<p><code class="inline-code">SYSCALL_DEFINE3</code> 의 3 은 인자가 3 개라는 뜻. 인자가 0 ~ 6 개일 수 있으므로 <code class="inline-code">SYSCALL_DEFINE0</code> ~ <code class="inline-code">SYSCALL_DEFINE6</code> 까지 있다.</p>
+<p>이 매크로가 펼쳐지면 — 같은 위치에 여러 심볼이 자동으로 생성된다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - include/linux/syscalls.h master]</span>
+<span class="hl-co">// SYSCALL_DEFINE3 의 본체 (단순화)</span>
+
+#define <span class="hl-fn">SYSCALL_DEFINE3</span>(name, ...) <span class="hl-fn">SYSCALL_DEFINEx</span>(<span class="hl-num">3</span>, _##name, __VA_ARGS__)
+
+#define <span class="hl-fn">SYSCALL_DEFINEx</span>(x, sname, ...)                   \
+    <span class="hl-fn">SYSCALL_METADATA</span>(sname, x, __VA_ARGS__)              \
+    <span class="hl-fn">__SYSCALL_DEFINEx</span>(x, sname, __VA_ARGS__)
+
+#define <span class="hl-fn">__SYSCALL_DEFINEx</span>(x, name, ...)                  \
+    asmlinkage <span class="hl-kw">long</span> __x64_sys##<span class="hl-fn">name</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *regs);  \
+    <span class="hl-fn">ALLOW_ERROR_INJECTION</span>(__x64_sys##name, ERRNO);       \
+    <span class="hl-kw">static</span> <span class="hl-kw">long</span> __se_sys##<span class="hl-fn">name</span>(<span class="hl-fn">__MAP</span>(x,__SC_LONG,__VA_ARGS__));   \
+    <span class="hl-kw">static</span> <span class="hl-kw">inline</span> <span class="hl-kw">long</span> __do_sys##<span class="hl-fn">name</span>(<span class="hl-fn">__MAP</span>(x,__SC_DECL,__VA_ARGS__));  \
+    <span class="hl-fn">__X64_SYS_STUBx</span>(x, name, __VA_ARGS__)                \
+    <span class="hl-kw">static</span> <span class="hl-kw">long</span> __se_sys##<span class="hl-fn">name</span>(<span class="hl-fn">__MAP</span>(x,__SC_LONG,__VA_ARGS__))    \
+    {                                                    \
+        <span class="hl-kw">long</span> ret = __do_sys##<span class="hl-fn">name</span>(<span class="hl-fn">__MAP</span>(x,__SC_CAST,__VA_ARGS__)); \
+        <span class="hl-fn">__MAP</span>(x,__SC_TEST,__VA_ARGS__);                  \
+        <span class="hl-fn">__PROTECT</span>(x, ret, <span class="hl-fn">__MAP</span>(x,__SC_ARGS,__VA_ARGS__)); \
+        <span class="hl-kw">return</span> ret;                                      \
+    }                                                    \
+    <span class="hl-kw">static</span> <span class="hl-kw">inline</span> <span class="hl-kw">long</span> __do_sys##<span class="hl-fn">name</span>(<span class="hl-fn">__MAP</span>(x,__SC_DECL,__VA_ARGS__))</code></pre>
+<p>복잡해 보이지만 결과는 단순하다. <code class="inline-code">SYSCALL_DEFINE3(write, ...)</code> 한 줄이 다음 세 심볼을 만든다:</p>
+<pre class="code-block lang-text"><code>[SYSCALL_DEFINE3(write, ...) 가 생성하는 심볼들]
+
+1. __x64_sys_write
+   - sys_call_table[1] 에 등록되는 wrapper
+   - 인자: const struct pt_regs *regs (한 개)
+   - regs 에서 fd, buf, count 를 꺼내서 __se_sys_write 호출
+
+2. __se_sys_write (static)
+   - 보안 검증 wrapper (sign-extension 등)
+   - 인자: long fd, long buf, long count
+   - __do_sys_write 호출
+
+3. __do_sys_write (static inline)
+   - 실제 본체
+   - 인자: unsigned int fd, const char __user *buf, size_t count</code></pre>
+<p>세 단계 wrapper 의 이유는 — <strong>32-bit / 64-bit 호환성</strong>, <strong>타입 안전성</strong>, <strong>추적/디버그</strong> 등 여러 관심사를 분리하기 위해서다.</p>
+<p>가장 안쪽의 <code class="inline-code">__do_sys_write</code> 가 사용자가 작성한 <code class="inline-code">SYSCALL_DEFINE3</code> 의 본문이다. 다음과 같이 펼쳐진다고 생각하면 된다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - SYSCALL_DEFINE3(write, ...) 의 효과적 펼침]</span>
+
+<span class="hl-co">// 1. sys_call_table 에 등록될 함수</span>
+asmlinkage <span class="hl-kw">long</span> <span class="hl-fn">__x64_sys_write</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *regs) {
+    <span class="hl-kw">return</span> <span class="hl-fn">__se_sys_write</span>(regs-&gt;di, regs-&gt;si, regs-&gt;dx);
+    <span class="hl-co">//                    ^^^^^^^  ^^^^^^^  ^^^^^^^</span>
+    <span class="hl-co">//                    fd       buf       count</span>
+}
+
+<span class="hl-co">// 2. 보안 검증 wrapper</span>
+<span class="hl-kw">static</span> <span class="hl-kw">long</span> <span class="hl-fn">__se_sys_write</span>(<span class="hl-kw">long</span> fd, <span class="hl-kw">long</span> buf, <span class="hl-kw">long</span> count) {
+    <span class="hl-kw">return</span> <span class="hl-fn">__do_sys_write</span>((<span class="hl-kw">unsigned</span> <span class="hl-kw">int</span>)fd, (<span class="hl-kw">const</span> <span class="hl-kw">char</span> __user *)buf, (<span class="hl-kw">size_t</span>)count);
+}
+
+<span class="hl-co">// 3. 실제 본체</span>
+<span class="hl-kw">static</span> <span class="hl-kw">inline</span> <span class="hl-kw">long</span> <span class="hl-fn">__do_sys_write</span>(<span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> fd, <span class="hl-kw">const</span> <span class="hl-kw">char</span> __user *buf, <span class="hl-kw">size_t</span> count) {
+    <span class="hl-kw">return</span> <span class="hl-fn">ksys_write</span>(fd, buf, count);
+}</code></pre>
+<h3 id="sys_call_table-의-master-정의">sys_call_table 의 master 정의</h3>
+<p>이제 <code class="inline-code">sys_call_table</code> 자체가 어떻게 만들어지는지 본다. master 의 <code class="inline-code">arch/x86/entry/syscall_64.c</code> 에 정의되어 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - arch/x86/entry/syscall_64.c master]</span>
+#include &lt;linux/entry-common.h&gt;
+#include &lt;linux/nospec.h&gt;
+#include &lt;<span class="hl-kw">asm</span>/syscall.h&gt;
+
+#define <span class="hl-fn">__SYSCALL</span>(nr, sym) <span class="hl-kw">extern</span> <span class="hl-kw">long</span> __x64_##<span class="hl-fn">sym</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *);
+#define <span class="hl-fn">__SYSCALL_NORETURN</span>(nr, sym) <span class="hl-kw">extern</span> <span class="hl-kw">long</span> __noreturn __x64_##<span class="hl-fn">sym</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *);
+#include &lt;<span class="hl-kw">asm</span>/syscalls_64.h&gt;     <span class="hl-co">/* ← 모든 syscall extern 선언 */</span>
+#undef  __SYSCALL
+
+#undef  __SYSCALL_NORETURN
+#define __SYSCALL_NORETURN __SYSCALL
+
+#define <span class="hl-fn">__SYSCALL</span>(nr, sym) __x64_##sym,
+<span class="hl-kw">const</span> sys_call_ptr_t sys_call_table[] = {
+#include &lt;<span class="hl-kw">asm</span>/syscalls_64.h&gt;     <span class="hl-co">/* ← table 의 본체 */</span>
+};
+#undef  __SYSCALL
+
+#define <span class="hl-fn">__SYSCALL</span>(nr, sym) <span class="hl-kw">case</span> nr: <span class="hl-kw">return</span> __x64_##<span class="hl-fn">sym</span>(regs);
+<span class="hl-kw">long</span> <span class="hl-fn">x64_sys_call</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *regs, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> nr)
+{
+    <span class="hl-kw">switch</span> (nr) {
+    #include &lt;<span class="hl-kw">asm</span>/syscalls_64.h&gt;  <span class="hl-co">/* ← dispatch switch */</span>
+    <span class="hl-kw">default</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_ni_syscall</span>(regs);
+    }
+}</code></pre>
+<p>같은 <code class="inline-code">asm/syscalls_64.h</code> 파일을 <strong>세 번</strong> 다르게 include 한다. 매크로 <code class="inline-code">__SYSCALL</code> 의 정의를 바꿔가면서. 이게 C 의 매크로를 영리하게 활용한 패턴이다.</p>
+<p><code class="inline-code">asm/syscalls_64.h</code> 는 빌드 시점에 <code class="inline-code">syscall_64.tbl</code> 로부터 자동 생성된다. 예를 들면 이런 내용:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - asm/syscalls_64.h (빌드 시 생성)]</span>
+<span class="hl-fn">__SYSCALL</span>(<span class="hl-num">0</span>, sys_read)
+<span class="hl-fn">__SYSCALL</span>(<span class="hl-num">1</span>, sys_write)
+<span class="hl-fn">__SYSCALL</span>(<span class="hl-num">2</span>, sys_open)
+<span class="hl-fn">__SYSCALL</span>(<span class="hl-num">3</span>, sys_close)
+...</code></pre>
+<p>세 번 include 의 효과:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// 첫 번째 include — extern 선언 생성</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">long</span> <span class="hl-fn">__x64_sys_read</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *);
+<span class="hl-kw">extern</span> <span class="hl-kw">long</span> <span class="hl-fn">__x64_sys_write</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *);
+<span class="hl-kw">extern</span> <span class="hl-kw">long</span> <span class="hl-fn">__x64_sys_open</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *);
+...
+
+<span class="hl-co">// 두 번째 include — table 배열 생성</span>
+<span class="hl-kw">const</span> sys_call_ptr_t sys_call_table[] = {
+    __x64_sys_read,    <span class="hl-co">// [0]</span>
+    __x64_sys_write,   <span class="hl-co">// [1]</span>
+    __x64_sys_open,    <span class="hl-co">// [2]</span>
+    __x64_sys_close,   <span class="hl-co">// [3]</span>
+    ...
+};
+
+<span class="hl-co">// 세 번째 include — switch dispatch 생성</span>
+<span class="hl-kw">long</span> <span class="hl-fn">x64_sys_call</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pt_regs *regs, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> nr) {
+    <span class="hl-kw">switch</span> (nr) {
+    <span class="hl-kw">case</span> <span class="hl-num">0</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_read</span>(regs);
+    <span class="hl-kw">case</span> <span class="hl-num">1</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_write</span>(regs);
+    <span class="hl-kw">case</span> <span class="hl-num">2</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_open</span>(regs);
+    <span class="hl-kw">case</span> <span class="hl-num">3</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_close</span>(regs);
+    ...
+    <span class="hl-kw">default</span>: <span class="hl-kw">return</span> <span class="hl-fn">__x64_sys_ni_syscall</span>(regs);
+    }
+}</code></pre>
+<h3 id="do_syscall_64-dispatch-의-본체">do_syscall_64 — dispatch 의 본체</h3>
+<p>master 의 <code class="inline-code">arch/x86/entry/common.c</code> (또는 최근에는 <code class="inline-code">arch/x86/entry/syscall_64.c</code> 로 분리됨) 에 <code class="inline-code">do_syscall_64</code> 가 있다. 이게 entry_SYSCALL_64 (어셈블리) 에서 호출되는 첫 C 함수다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - arch/x86/entry/syscall_64.c master, 단순화]</span>
+<span class="hl-co">/* Returns true to return using SYSRET, or false to use IRET */</span>
+__visible noinstr <span class="hl-kw">bool</span> <span class="hl-fn">do_syscall_64</span>(<span class="hl-kw">struct</span> pt_regs *regs, <span class="hl-kw">int</span> nr)
+{
+    <span class="hl-fn">add_random_kstack_offset</span>();
+    nr = <span class="hl-fn">syscall_enter_from_user_mode</span>(regs, nr);
+
+    <span class="hl-fn">instrumentation_begin</span>();
+
+    <span class="hl-kw">if</span> (!<span class="hl-fn">do_syscall_x64</span>(regs, nr) &amp;&amp; !<span class="hl-fn">do_syscall_x32</span>(regs, nr) &amp;&amp; nr != -<span class="hl-num">1</span>) {
+        <span class="hl-co">/* Invalid system call, but still a system call. */</span>
+        regs-&gt;ax = <span class="hl-fn">__x64_sys_ni_syscall</span>(regs);
+    }
+
+    <span class="hl-fn">instrumentation_end</span>();
+    <span class="hl-fn">syscall_exit_to_user_mode</span>(regs);
+
+    <span class="hl-co">/* SYSRET 로 user-space 복귀가 안전한지 확인.
+       안전하지 않으면 (XEN PV guest 등) IRET 로 폴백. */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">cpu_feature_enabled</span>(X86_FEATURE_XENPV))
+        <span class="hl-kw">return</span> <span class="hl-kw">false</span>;
+    <span class="hl-co">/* ... 추가 SYSRET 안전성 검사 ... */</span>
+    <span class="hl-kw">return</span> <span class="hl-kw">true</span>;
+}
+
+<span class="hl-kw">static</span> __always_inline <span class="hl-kw">bool</span> <span class="hl-fn">do_syscall_x64</span>(<span class="hl-kw">struct</span> pt_regs *regs, <span class="hl-kw">int</span> nr)
+{
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> unr = nr;
+
+    <span class="hl-kw">if</span> (<span class="hl-fn">likely</span>(unr &lt; NR_syscalls)) {
+        unr = <span class="hl-fn">array_index_nospec</span>(unr, NR_syscalls);
+        regs-&gt;ax = <span class="hl-fn">x64_sys_call</span>(regs, unr);
+        <span class="hl-kw">return</span> <span class="hl-kw">true</span>;
+    }
+    <span class="hl-kw">return</span> <span class="hl-kw">false</span>;
+}</code></pre>
+<p><code class="inline-code">bool</code> 반환의 의미는 — entry assembly 가 <code class="inline-code">SYSRET</code> (빠른 경로) 으로 user-space 에 돌아갈지, <code class="inline-code">IRET</code> (느리지만 안전한 경로) 로 돌아갈지 결정. 대부분의 경우 <code class="inline-code">true</code> (SYSRET) 가 반환되지만, XEN PV guest 같은 환경에서는 <code class="inline-code">false</code> (IRET) 가 반환된다.</p>
+<p>(역사적 참고: 이 함수의 시그니처는 master 에서 여러 번 변경되었다 — 옛날에는 <code class="inline-code">unsigned long nr</code> 가 첫 인자, 그 다음 <code class="inline-code">void</code> 반환, 최근 2025년 부터 다시 <code class="inline-code">bool</code> 반환. 항상 정확한 시그니처는 master 의 현재 commit 을 참조하는 게 좋다.)</p>
+<p>주목할 점은 <strong>두 가지 방식의 dispatch</strong> 다.</p>
+<p>1. <strong>함수 포인터 테이블</strong> (<code class="inline-code">sys_call_table[nr]</code>) — 옛 방식. 단순한 array indexing.</p>
+<p>2. <strong>switch case</strong> (<code class="inline-code">x64_sys_call(regs, nr)</code>) — 새 방식 (master 가 현재 쓰는 것). switch 가 컴파일러에 의해 jump table 로 최적화된다. 그리고 indirect call 이 아니므로 <strong>Spectre 와 같은 speculative execution 공격에 더 안전</strong>하다.</p>
+<p>master 의 주석을 보면 <code class="inline-code">sys_call_table[]</code> 은 &quot;no longer used for system calls&quot; 라고 명시되어 있다. 추적 (ftrace) 용도로만 남아 있다.</p>
+<pre class="code-block lang-text"><code>[dispatch 방식의 진화]
+
+옛 방식 (~ kernel 5.x):
+   call *sys_call_table(,%rax,8)        ; indirect call
+   ↑ Spectre 공격 위험
+
+새 방식 (master, 6.x):
+   switch (nr) {
+     case 0: return __x64_sys_read(regs);
+     case 1: return __x64_sys_write(regs);
+     ...
+   }
+   ↑ direct call, jump table 최적화 가능
+   ↑ array_index_nospec 으로 추가 보안</code></pre>
+<p><code class="inline-code">array_index_nospec</code> 매크로는 — Spectre v1 (bounds check bypass) 공격을 막기 위한 것이다. CPU 의 speculative execution 이 bounds check 를 우회하지 못하도록 강제한다.</p>
+<h3 id="pt_regs-모든-register-의-snapshot">pt_regs — 모든 register 의 snapshot</h3>
+<p><code class="inline-code">do_syscall_64</code> 와 <code class="inline-code">__x64_sys_write</code> 가 받는 <code class="inline-code">pt_regs *regs</code> 는 무엇인가. user-space 에서 진입할 때 모든 register 의 값을 저장한 구조체다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - arch/x86/include/asm/ptrace.h master, x86_64 단순화]</span>
+<span class="hl-kw">struct</span> pt_regs {
+    <span class="hl-co">/* C ABI here */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r15;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r14;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r13;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r12;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> bp;        <span class="hl-co">/* rbp */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> bx;        <span class="hl-co">/* rbx */</span>
+    <span class="hl-co">/* These regs are callee-clobbered */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r11;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r10;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r9;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> r8;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> ax;        <span class="hl-co">/* rax — syscall 번호 + 반환값 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> cx;        <span class="hl-co">/* rcx — syscall return address */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> dx;        <span class="hl-co">/* rdx — arg3 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> si;        <span class="hl-co">/* rsi — arg2 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> di;        <span class="hl-co">/* rdi — arg1 */</span>
+    <span class="hl-co">/* On syscall entry, this is syscall#. */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> orig_ax;
+    <span class="hl-co">/* Return frame */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> ip;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> cs;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> flags;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> sp;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> ss;
+};</code></pre>
+<p><code class="inline-code">entry_SYSCALL_64</code> 의 어셈블리가 register 들을 차례로 push 해서 이 구조체를 stack 위에 만든다. 그러면 그 stack 주소가 <code class="inline-code">pt_regs *</code> 포인터가 되고, C 코드는 그것을 통해 user-space 의 모든 register 를 읽을 수 있다.</p>
+<p><code class="inline-code">__x64_sys_write</code> 가 <code class="inline-code">regs-&gt;di, regs-&gt;si, regs-&gt;dx</code> 를 읽는 것은 — user-space 의 rdi, rsi, rdx 레지스터에 있던 fd, buf, count 값을 읽는 것이다.</p>
+<h3 id="전체-dispatch-흐름-종합">전체 dispatch 흐름 — 종합</h3>
+<p>지금까지의 모든 사실을 한 그림으로 정리한다.</p>
+<pre class="code-block lang-text"><code>┌─────────────────────────────────────────────────────────────┐
+│ [user-space]                                                 │
+│                                                              │
+│   syscall 명령어                                              │
+│     rax = 1                                                  │
+│     rdi = fd                                                 │
+│     rsi = buf                                                │
+│     rdx = count                                              │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          │ CPU: 권한 상승 (Ring 3 → Ring 0)
+                          │      MSR_LSTAR 의 주소로 점프
+                          ▼
+╔═════════════════════════════════════════════════════════════╗
+║ [kernel-space] arch/x86/entry/entry_64.S                     ║
+║                                                              ║
+║   entry_SYSCALL_64 (어셈블리)                                ║
+║     swapgs                       ; user→kernel GS            ║
+║     kernel stack 전환             ; per-CPU stack            ║
+║     모든 register push           ; pt_regs 구성               ║
+║     call do_syscall_64                                       ║
+╚═════════════════════════════════════════════════════════════╝
+                          │
+                          ▼
+╔═════════════════════════════════════════════════════════════╗
+║ [kernel-space] arch/x86/entry/common.c                       ║
+║                                                              ║
+║   do_syscall_64(struct pt_regs *regs, int nr)                ║
+║     - nr = pt_regs-&gt;orig_ax (= 사용자 rax)                    ║
+║     - syscall_enter_from_user_mode (audit, seccomp 등)        ║
+║     - do_syscall_x64(regs, nr)                                ║
+║         → x64_sys_call(regs, nr)                              ║
+║             switch (nr) {                                     ║
+║                 case 1: return __x64_sys_write(regs);  ←      ║
+║                 ...                                          ║
+║             }                                                ║
+║     - regs-&gt;ax = 반환값 저장                                   ║
+║     - syscall_exit_to_user_mode (signal 처리 등)              ║
+╚═════════════════════════════════════════════════════════════╝
+                          │
+                          ▼
+╔═════════════════════════════════════════════════════════════╗
+║ [kernel-space] fs/read_write.c                               ║
+║                                                              ║
+║   __x64_sys_write(const struct pt_regs *regs)                ║
+║     → __se_sys_write(regs-&gt;di, regs-&gt;si, regs-&gt;dx)            ║
+║         → __do_sys_write(fd, buf, count)                      ║
+║             → ksys_write(fd, buf, count)                      ║
+║                 → vfs_write(...)                              ║
+║                     → 파일 시스템별 write 함수                  ║
+╚═════════════════════════════════════════════════════════════╝
+                          │
+                          │ 작업 완료, 반환값 rax 에
+                          ▼
+       (entry_SYSCALL_64 의 sysretq 명령어로 user-space 복귀)
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│ [user-space]                                                 │
+│   syscall 다음 명령어부터 계속 실행                              │
+│   rax 에 반환값 (또는 -errno)                                  │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<p>이 흐름이 매번 <code class="inline-code">read()</code>, <code class="inline-code">write()</code>, <code class="inline-code">open()</code> 등을 호출할 때마다 일어난다. user-space 의 한 줄 코드가 kernel 의 깊은 곳까지 도달하는 정확한 길이다.</p>
+<h3 id="다른-아키텍처의-dispatch">다른 아키텍처의 dispatch</h3>
+<p>ARM64 와 RISC-V 도 같은 패턴이다. 다만 진입점 이름과 표 형식이 다르다.</p>
+<pre class="code-block lang-text"><code>[ARM64 의 dispatch]
+  el0t_64_sync (어셈블리, arch/arm64/kernel/entry.S)
+    → el0_svc (assembly)
+      → el0_svc_common (C, arch/arm64/kernel/syscall.c)
+        → invoke_syscall(regs, scno, sc_nr, syscall_table)
+          → syscall_table[scno](regs)
+            → SYSCALL_DEFINE 매크로로 생성된 함수
+
+[RISC-V 의 dispatch]
+  handle_exception (어셈블리, arch/riscv/kernel/entry.S)
+    → do_trap_ecall_u (C, arch/riscv/kernel/traps.c)
+      → syscall_handler(regs, syscall_id)
+        → SYSCALL_DEFINE 매크로로 생성된 함수</code></pre>
+<p>모든 아키텍처에서 <code class="inline-code">SYSCALL_DEFINE</code> 매크로로 생성된 함수가 최종 목적지라는 점은 같다. 위 매크로가 모든 아키텍처에서 통일된 syscall 인터페이스의 핵심이다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>syscall table 과 dispatch 메커니즘은 다음 요소로 구성된다.</p>
+<pre class="code-block lang-text"><code>1. syscall.tbl   →  사람이 작성하는 번호-이름 표
+
+2. SYSCALL_DEFINEx   →  syscall 본체를 작성하는 매크로
+                       (자동으로 wrapper 들을 생성)
+
+3. asm/syscalls_64.h   →  빌드 시 생성되는 매크로 호출 목록
+
+4. sys_call_table[]   →  함수 포인터 배열 (현재는 ftrace 용도만)
+
+5. x64_sys_call switch   →  현재의 dispatch 방식 (안전성)
+
+6. do_syscall_64   →  진입 후의 첫 C 함수, dispatch 호출
+
+7. pt_regs   →  user-space register snapshot, C 코드의 인자</code></pre>
+<p>핵심은 — <strong>syscall 정의는 매우 우아하게 매크로화되어 있고</strong>, <strong>빌드 시점에 자동 코드 생성</strong>으로 보일러플레이트가 제거되며, <strong>dispatch 자체는 매우 단순한 switch/배열 lookup</strong> 이라는 점이다. user-space 코드 한 줄이 kernel 의 어디로 도달하는지를 이해하면 — strace 같은 도구의 출력이나 kernel 코드를 읽을 때 빠르게 navigate 할 수 있다.</p>
+<p>다음 장에서는 <code class="inline-code">errno</code> 가 thread-safe 하게 어떻게 구현되어 있는지 — TLS 의 정체와 <code class="inline-code">__errno_location</code> 의 비밀 — 을 본다.</p>
+<h2 class="section-heading" id="7-errno-의-thread-local-구현"><span class="section-num">7</span><span class="section-title">errno 의 thread-local 구현</span></h2>
+<p><code class="inline-code">errno</code> 는 매우 평범해 보이는 변수다. C 코드에서는 그냥 <code class="inline-code">errno</code> 라고 쓰면 된다. 그러나 그 한 단어 뒤에 — <strong>multi-thread 환경에서 thread-safe 한 per-thread 변수 + TLS 메커니즘 + 동적 링커의 협력</strong>이라는 정교한 구현이 숨어 있다. 이 장에서 그 비밀을 본다.</p>
+<h3 id="옛-errno-의-문제">옛 errno 의 문제</h3>
+<p>옛날 단일 스레드 시절에는 <code class="inline-code">errno</code> 가 단순한 전역 변수였다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 옛 C 라이브러리, 단순한 시절]</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> errno;           <span class="hl-co">// 전역 변수</span>
+
+<span class="hl-co">// libc 의 read() wrapper 도 단순했음</span>
+<span class="hl-kw">ssize_t</span> <span class="hl-fn">read</span>(<span class="hl-kw">int</span> fd, <span class="hl-kw">void</span> *buf, <span class="hl-kw">size_t</span> count) {
+    <span class="hl-kw">long</span> ret;
+    <span class="hl-kw">asm</span> <span class="hl-kw">volatile</span> (<span class="hl-str">&quot;syscall&quot;</span> ...);
+    <span class="hl-kw">if</span> (ret &lt; <span class="hl-num">0</span>) {
+        errno = -ret;       <span class="hl-co">// 전역 변수에 쓰기</span>
+        <span class="hl-kw">return</span> -<span class="hl-num">1</span>;
+    }
+    <span class="hl-kw">return</span> ret;
+}</code></pre>
+<p>multi-thread 시대가 오자 이 디자인이 문제를 일으켰다.</p>
+<pre class="code-block lang-text"><code>[multi-thread 에서 errno 의 race 시나리오]
+
+  Thread A                          Thread B
+  ──────────                       ──────────
+  fd = open(&quot;file_a&quot;, ...)
+    → syscall                       
+    → 실패 (ENOENT)                   
+    → errno = 2 (ENOENT)             fd = open(&quot;file_b&quot;, ...)
+                                       → syscall
+                                       → 실패 (EACCES)
+                                       → errno = 13 (EACCES)
+                                       
+                                     if (fd &lt; 0) {
+                                       perror(&quot;...&quot;);  // EACCES 출력
+                                     }
+                                     
+  if (fd &lt; 0) {
+    perror(&quot;...&quot;);  // EACCES 출력!  ← Thread A 의 ENOENT 가 사라짐
+  }</code></pre>
+<p>Thread A 의 errno 값이 Thread B 에 의해 덮어쓰여졌다. 같은 프로세스의 모든 thread 가 한 메모리를 공유하므로 — 전역 변수 <code class="inline-code">errno</code> 는 race condition 의 대상이 된다.</p>
+<p>이걸 해결하려면 — <strong>errno 가 thread 마다 별개의 메모리에 저장</strong>되어야 한다. 이것이 TLS (Thread-Local Storage) 의 정체다.</p>
+<h3 id="__errno_location-의-도입"><code class="inline-code">__errno_location()</code> 의 도입</h3>
+<p>modern glibc 의 <code class="inline-code">&lt;errno.h&gt;</code> 를 보면 errno 가 그냥 변수가 아니라 매크로로 정의되어 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - errno.h (glibc 의 단순화)]</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> *<span class="hl-fn">__errno_location</span>(<span class="hl-kw">void</span>) __THROW __attribute_const__;
+#define <span class="hl-fn">errno</span> (*<span class="hl-fn">__errno_location</span>())</code></pre>
+<p>즉 <code class="inline-code">errno = 2</code> 라는 코드는 실제로 <code class="inline-code">*__errno_location() = 2</code> 가 된다. <strong>함수 호출이 변수처럼 보이는 매크로 트릭</strong>이다.</p>
+<p><code class="inline-code">__errno_location()</code> 의 본체는 — <strong>현재 thread 의 errno 가 저장된 메모리 주소를 반환</strong>한다. thread 마다 다른 주소를 반환하므로, 다른 thread 의 errno 가 서로 충돌하지 않는다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc 의 __errno_location() 개념적 구현]</span>
+<span class="hl-kw">int</span> *<span class="hl-fn">__errno_location</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-co">// 현재 thread 의 TLS 영역에 있는 errno 의 주소를 반환</span>
+    <span class="hl-kw">return</span> &amp;__libc_errno;   <span class="hl-co">// __libc_errno 는 __thread 변수</span>
+}</code></pre>
+<p>자, 그런데 — <code class="inline-code">__libc_errno</code> 가 어떻게 &quot;thread 마다 다른 메모리&quot; 가 되는가? 그게 TLS 의 핵심 메커니즘이다.</p>
+<h3 id="__thread-키워드-컴파일러-차원의-tls"><code class="inline-code">__thread</code> 키워드 — 컴파일러 차원의 TLS</h3>
+<p>GCC, Clang 등 modern 컴파일러는 <code class="inline-code">__thread</code> 라는 storage class specifier 를 지원한다. (C11 의 <code class="inline-code">_Thread_local</code>, C++11 의 <code class="inline-code">thread_local</code> 과 동일한 기능)</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - TLS 변수 선언]</span>
+<span class="hl-kw">__thread</span> <span class="hl-kw">int</span> my_var = <span class="hl-num">0</span>;   <span class="hl-co">// thread 마다 별개의 인스턴스</span></code></pre>
+<p>이 변수에 접근하는 것은 <strong>일반 변수와 코드가 다르다</strong>. 보통 변수는 고정된 메모리 주소를 가지지만, TLS 변수는 <strong>thread 마다 다른 주소</strong>를 가진다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - TLS 변수 사용]</span>
+<span class="hl-kw">void</span> <span class="hl-fn">thread_func</span>(<span class="hl-kw">void</span>) {
+    my_var = <span class="hl-num">42</span>;            <span class="hl-co">// 이 thread 의 my_var 인스턴스에 쓰기</span>
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;%d\n&quot;</span>, my_var); <span class="hl-co">// 이 thread 의 my_var 인스턴스 읽기</span>
+}
+
+<span class="hl-co">// 다른 thread 에서:</span>
+<span class="hl-kw">void</span> <span class="hl-fn">other_thread</span>(<span class="hl-kw">void</span>) {
+    my_var = <span class="hl-num">100</span>;           <span class="hl-co">// 다른 thread 의 별개 my_var</span>
+    <span class="hl-co">// 두 thread 의 my_var 가 서로 영향 없음</span>
+}</code></pre>
+<p>컴파일러가 이 코드를 어떻게 어셈블리로 번역하는가? 비밀은 <strong>segment register</strong> 에 있다.</p>
+<h3 id="x86_64-의-tls-fs-segment-register">x86_64 의 TLS — FS segment register</h3>
+<p>x86 의 옛 segmentation 메커니즘은 대부분 obsolete 되었지만, 두 segment register 가 살아남았다 — <strong>FS</strong> 와 <strong>GS</strong>. modern Linux 는 이 두 register 를 thread-local 데이터 접근에 사용한다.</p>
+<pre class="code-block lang-text"><code>[x86_64 TLS 메커니즘]
+
+  FS register
+    └─→ FS.base = 0x7ffff1234000 (예시 주소)
+                         │
+                         ▼
+              ┌────────────────────────┐
+              │ Thread Control Block    │  ← FS.base 가 가리키는 곳
+              │ (struct pthread)       │
+              ├────────────────────────┤
+              │ TLS 변수들 (__thread)    │
+              │   my_var               │
+              │   errno                │
+              │   ...                  │
+              └────────────────────────┘
+              
+  TLS 변수 접근 예:
+  
+  movl  %fs:0x10, %eax     ; FS.base + 0x10 의 4바이트를 eax 로
+                           ; (이 offset 은 컴파일러가 정함)</code></pre>
+<p><strong>FS register 의 base</strong> 주소가 thread 마다 다르게 설정된다. 같은 코드 (<code class="inline-code">movl %fs:0x10, %eax</code>) 가 thread 마다 다른 메모리를 읽는 셈이다.</p>
+<p>FS.base 의 설정은 kernel 이 해준다. glibc 가 thread 생성 시 <code class="inline-code">arch_prctl(ARCH_SET_FS, addr)</code> syscall 을 호출해서 FS.base 를 새 TLS 영역의 주소로 설정한다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc/sysdeps/x86_64/nptl/tls.h master, 단순화]</span>
+#define <span class="hl-fn">TLS_INIT_TP</span>(thrdescr) ({                            \
+    <span class="hl-kw">void</span> *_thrdescr = (thrdescr);                          \
+    <span class="hl-kw">long</span> _result;                                          \
+    <span class="hl-kw">asm</span> <span class="hl-kw">volatile</span> (                                         \
+        <span class="hl-str">&quot;syscall&quot;</span>                                          \
+        : <span class="hl-str">&quot;=a&quot;</span> (_result)                                   \
+        : <span class="hl-str">&quot;0&quot;</span> (__NR_arch_prctl), <span class="hl-str">&quot;D&quot;</span> (ARCH_SET_FS), <span class="hl-str">&quot;S&quot;</span> (_thrdescr)  \
+        : <span class="hl-str">&quot;memory&quot;</span>, <span class="hl-str">&quot;cc&quot;</span>, <span class="hl-str">&quot;r11&quot;</span>, <span class="hl-str">&quot;cx&quot;</span>);                    \
+    _result == <span class="hl-num">0</span> ? <span class="hl-kw">NULL</span> : <span class="hl-str">&quot;set_thread_area failed&quot;</span>;        \
+})</code></pre>
+<p>이 매크로가 새 thread 의 TLS 시작 주소를 FS.base 에 등록한다. 그 후 모든 TLS 변수 접근이 FS register 를 통해서 일어난다.</p>
+<h3 id="arm64-의-tls-tpidr_el0-register">ARM64 의 TLS — TPIDR_EL0 register</h3>
+<p>ARM64 는 segment register 가 없다. 대신 <strong>TPIDR_EL0</strong> (Thread Pointer ID Register at EL0) 라는 전용 register 를 쓴다.</p>
+<pre class="code-block lang-text"><code>[ARM64 TLS 메커니즘]
+
+  TPIDR_EL0 register
+    └─→ 0xfffeabcd1234 (예시 주소)
+                │
+                ▼
+              ┌────────────────────────┐
+              │ Thread Control Block    │
+              │ TLS 변수들              │
+              └────────────────────────┘
+
+  TLS 변수 접근:
+  
+  mrs   x0, tpidr_el0      ; TPIDR_EL0 의 값을 x0 으로
+  ldr   w1, [x0, #0x10]    ; x0 + 0x10 에서 4바이트 로드</code></pre>
+<p>x86 보다 더 깔끔한 디자인이다. 전용 register 가 thread pointer 를 보관하므로 hardware 가 segment 계산을 하지 않는다. ARM64 에서는 user-space 가 <code class="inline-code">MRS</code> 명령어로 직접 <code class="inline-code">TPIDR_EL0</code> 를 읽을 수 있고, kernel 이 thread 전환 시 이 register 의 값을 swap 한다.</p>
+<h3 id="__errno_location-의-실제-디스어셈블"><code class="inline-code">__errno_location()</code> 의 실제 디스어셈블</h3>
+<p>이론은 충분히 봤다. 실제 glibc 의 <code class="inline-code">__errno_location()</code> 함수를 디스어셈블하면 어떻게 보이는지 확인하자. x86_64 의 glibc 2.39 의 본체는 매우 간단하다.</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - glibc 의 __errno_location() x86_64 어셈블리 패턴]</span>
+<span class="hl-co">; (정확한 offset 은 glibc 버전마다 다름. 다음은 일반적 패턴)</span>
+<span class="hl-fn">__errno_location</span>:
+    <span class="hl-kw">mov</span>    <span class="hl-kw">%fs</span>:<span class="hl-num">0x0</span>, <span class="hl-kw">%rax</span>      <span class="hl-co">; FS.base (= TCB 주소) 를 rax 로</span>
+    <span class="hl-kw">lea</span>    OFFSET(<span class="hl-kw">%rax</span>), <span class="hl-kw">%rax</span> <span class="hl-co">; TCB 안의 errno offset 으로 조정</span>
+    <span class="hl-fn">retq</span>                       <span class="hl-co">; 반환</span>
+
+<span class="hl-co">; OFFSET 의 정확한 값은 glibc 빌드 시점에 dynamic linker 가 결정</span>
+<span class="hl-co">; 컴파일러는 errno@tpoff 같은 relocation 으로 표현하고,</span>
+<span class="hl-co">; ld-linux.so 가 로드 시 실제 offset 으로 패치</span></code></pre>
+<p>세 줄짜리 함수다. 하지만 이 세 줄에 매우 많은 사실이 담겨 있다.</p>
+<pre class="code-block lang-text"><code>[__errno_location 의 분석]
+
+1. mov %fs:0x0, %rax
+   - FS register 의 base 주소를 읽음 (kernel 이 설정해 둔 값)
+   - 이게 곧 현재 thread 의 TCB (Thread Control Block) 주소
+   
+2. lea OFFSET(%rax), %rax
+   - TCB 주소에 정해진 offset 을 더함 (보통 음수)
+   - 그 위치에 errno 변수가 저장되어 있음
+   - 정확한 OFFSET 은 컴파일러/링커가 정함
+   
+3. retq
+   - errno 의 주소를 rax 에 담고 반환</code></pre>
+<p>GCC 가 컴파일 시 사용하는 패턴은 다음 두 가지다:</p>
+<pre class="code-block lang-text"><code>[TLS 변수 접근의 두 가지 패턴 - x86_64]
+
+(a) 직접 접근 (간단한 경우):
+   movl  %fs:errno@tpoff, %eax    ; FS:offset 직접 접근
+   ↑ 함수 호출 없이 한 명령어로 errno 읽기
+
+(b) __errno_location() 경유 (간접 접근):
+   call  __errno_location          ; 함수 호출
+   movl  (%rax), %eax              ; 반환된 주소에서 읽기
+   ↑ 함수 포인터로 추상화, ABI 안정성</code></pre>
+<p>glibc 자체는 (b) 패턴으로 errno 를 노출한다 — <code class="inline-code">__errno_location()</code> 함수가 표준화된 ABI 다. 컴파일러는 <code class="inline-code">__attribute__((const))</code> 를 보고 호출 결과를 캐싱해서 최적화할 수 있다.</p>
+<p>ARM64 의 경우는 비슷한 작업이 다른 명령어로:</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; [user-space - glibc 의 __errno_location() ARM64 어셈블리 패턴]</span>
+<span class="hl-fn">__errno_location</span>:
+    <span class="hl-fn">mrs</span>    x0, tpidr_el0       <span class="hl-co">; thread pointer 읽기</span>
+    <span class="hl-kw">add</span>    x0, x0, <span class="hl-co">#OFFSET     ; errno offset 더하기 (정확한 값은 빌드 시점)</span>
+    <span class="hl-kw">ret</span></code></pre>
+<h3 id="errno-사용의-완전한-흐름">errno 사용의 완전한 흐름</h3>
+<p>이제 사용자가 <code class="inline-code">read(fd, buf, n)</code> 을 호출했을 때 errno 가 어떻게 설정되는지 — 모든 단계를 본다.</p>
+<pre class="code-block lang-text"><code>[errno 설정의 완전한 흐름]
+
+  user-space (사용자 코드):
+    ssize_t n = read(fd, buf, 100);
+    if (n == -1) {
+        printf(&quot;error: %d\n&quot;, errno);   // ← 이 errno 가 thread-local
+    }
+
+         │
+         ▼ glibc read() wrapper 호출
+
+  user-space (glibc):
+    ssize_t read(int fd, void *buf, size_t count) {
+        long ret;
+        asm volatile (&quot;syscall&quot;
+            : &quot;=a&quot;(ret) : &quot;0&quot;(0), &quot;D&quot;(fd), &quot;S&quot;(buf), &quot;d&quot;(count)
+            : &quot;rcx&quot;, &quot;r11&quot;, &quot;memory&quot;);
+        
+        if (ret &lt; 0) {
+            // errno = -ret 와 동등
+            // 매크로가 펼쳐지면:
+            //   *__errno_location() = -ret
+            *(__errno_location()) = -ret;   // ← FS 기반 TLS 쓰기
+            return -1;
+        }
+        return ret;
+    }
+
+         │
+         ▼ syscall 명령어 실행
+
+  ════════════════════════════════ user/kernel 경계
+
+  kernel-space:
+    sys_read(fd, buf, 100)
+      → 실패 시 ret = -EBADF (예) 를 반환
+
+  ════════════════════════════════ 복귀
+
+  user-space (glibc 의 wrapper 안):
+    ret = -EBADF (= -9)
+    *__errno_location() = 9         // EBADF
+    return -1
+
+         │
+         ▼
+
+  user-space (사용자 코드):
+    n = -1
+    errno  →  *__errno_location()  →  현재 thread 의 EBADF (9)
+    printf 호출</code></pre>
+<p>핵심은 — **errno 의 read 와 write 가 모두 <code class="inline-code">__errno_location()</code> 함수 호출**을 거친다는 점이다. 컴파일러가 이 함수 호출을 inline 하거나 최적화할 수 있지만, 결국 FS register 를 통한 thread-local 접근이 일어난다.</p>
+<h3 id="errno-값들의-master-정의">errno 값들의 master 정의</h3>
+<p>errno 의 정수 값들은 어디에 정의되어 있는가? Linux master 와 glibc 둘 다 정의를 가진다.</p>
+<pre class="code-block lang-text"><code>[Linux master 의 errno 정의]
+
+include/uapi/asm-generic/errno-base.h   - 기본 errno (1~ 34)
+include/uapi/asm-generic/errno.h        - 추가 errno (35 ~)
+arch/&lt;arch&gt;/include/uapi/asm/errno.h    - 아키텍처별 오버라이드</code></pre>
+<p><code class="inline-code">errno-base.h</code> 의 일부 (master 인용):</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - include/uapi/asm-generic/errno-base.h master]</span>
+#define EPERM       <span class="hl-num">1</span>   <span class="hl-co">/* Operation not permitted */</span>
+#define ENOENT      <span class="hl-num">2</span>   <span class="hl-co">/* No such file or directory */</span>
+#define ESRCH       <span class="hl-num">3</span>   <span class="hl-co">/* No such process */</span>
+#define EINTR       <span class="hl-num">4</span>   <span class="hl-co">/* Interrupted system call */</span>
+#define EIO         <span class="hl-num">5</span>   <span class="hl-co">/* I/O error */</span>
+#define ENXIO       <span class="hl-num">6</span>   <span class="hl-co">/* No such device or address */</span>
+#define E2BIG       <span class="hl-num">7</span>   <span class="hl-co">/* Argument list too long */</span>
+#define ENOEXEC     <span class="hl-num">8</span>   <span class="hl-co">/* Exec format error */</span>
+#define EBADF       <span class="hl-num">9</span>   <span class="hl-co">/* Bad file descriptor */</span>
+#define ECHILD     <span class="hl-num">10</span>   <span class="hl-co">/* No child processes */</span>
+#define EAGAIN     <span class="hl-num">11</span>   <span class="hl-co">/* Try again */</span>
+#define ENOMEM     <span class="hl-num">12</span>   <span class="hl-co">/* Out of memory */</span>
+#define EACCES     <span class="hl-num">13</span>   <span class="hl-co">/* Permission denied */</span>
+#define EFAULT     <span class="hl-num">14</span>   <span class="hl-co">/* Bad address */</span>
+...</code></pre>
+<p>이 값들이 kernel 의 -errno 반환과 user-space 의 errno 둘 다에서 같은 값으로 쓰인다. user-space 의 glibc 는 <code class="inline-code">&lt;errno.h&gt;</code> 에서 이 정의를 그대로 import 한다.</p>
+<h3 id="왜-errno-가-함수냐-두-가지-디자인-옵션">&quot;왜 errno 가 함수냐&quot; — 두 가지 디자인 옵션</h3>
+<p>errno 를 thread-local 로 만드는 데에 두 가지 디자인이 가능했다.</p>
+<pre class="code-block lang-text"><code>[옵션 1: 함수로 노출 - 현재의 glibc 방식]
+  
+  #define errno (*__errno_location())
+  
+  장점: 모든 컴파일러에서 동작 (TLS 지원 안 해도 됨)
+        ABI 안정성 (함수는 변하지 않음)
+  단점: 매 접근마다 함수 호출 (인라인되더라도)
+  
+[옵션 2: TLS 변수로 직접 노출]
+  
+  extern __thread int errno;
+  
+  장점: 함수 호출 없이 직접 접근, 더 빠름
+  단점: TLS 지원 컴파일러 필요
+        ABI 가 노출됨 (TLS 변수의 위치 등)</code></pre>
+<p>glibc 는 옵션 1 을 골랐다. **이유는 — <code class="inline-code">__errno_location</code> 의 호출 비용이 작고, ABI 안정성이 더 중요했다**. modern 컴파일러는 <code class="inline-code">__attribute__((const))</code> 가 붙은 <code class="inline-code">__errno_location()</code> 을 보면 같은 호출 결과를 재사용해서 최적화한다.</p>
+<p>glibc 의 master mailing list 에서 이 디자인 결정이 명시적으로 논의되었다 (master 인용):</p>
+<pre class="code-block lang-text"><code>&quot;There have been suggestions to expose TLS errno - but also suggestions
+ that use of __errno_location is more efficient, at least in terms of
+ code size everywhere errno is accessed (for some ABIs, anyway).&quot;
+                                                    — Joseph Myers, 2018</code></pre>
+<p>코드 크기 측면에서 함수 호출이 더 효율적이라는 결론이었다.</p>
+<h3 id="opter-의-호환성-함정">opter 의 호환성 함정</h3>
+<p>오래된 C 코드에서 종종 볼 수 있는 함정이 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 잘못된 코드]</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> errno;       <span class="hl-co">// ← 옛 시절의 패턴, modern glibc 와 호환 안 됨</span>
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>() {
+    <span class="hl-kw">if</span> (<span class="hl-fn">read</span>(...) &lt; <span class="hl-num">0</span>) {
+        <span class="hl-fn">printf</span>(<span class="hl-str">&quot;%d\n&quot;</span>, errno);   <span class="hl-co">// 잘못된 errno 를 봄</span>
+    }
+}</code></pre>
+<p><code class="inline-code">extern int errno</code> 라고 선언하면 — 일반 전역 변수에 link 하려고 시도한다. 그러나 modern glibc 에서는 errno 가 일반 변수가 아니라 TLS 변수이므로, link 가 실패하거나 잘못된 값이 표시된다.</p>
+<p>master 의 LKML 에 이 함정이 언급된다 (Arjan van de Ven, 2005):</p>
+<pre class="code-block lang-text"><code>&quot;errno is a glibc level thing really, and in recent glibc there is no
+ global errno anymore, only a per thread errno. The case that is known
+ to break is if your app has its own extern int errno; in it, instead
+ of using the proper header to get it.&quot;</code></pre>
+<p>해결책은 단순하다 — <code class="inline-code">#include &lt;errno.h&gt;</code> 만 하면 된다. 그러면 매크로 정의가 자동으로 적용된다.</p>
+<h3 id="errno-의-생애-tcb-의-일부">errno 의 생애 — TCB 의 일부</h3>
+<p>errno 가 저장되는 정확한 위치를 보면 — <code class="inline-code">struct pthread</code> (Thread Control Block) 의 한 멤버다. glibc 의 <code class="inline-code">nptl/descr.h</code> 에 정의되어 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc/nptl/descr.h master, struct pthread 단순화]</span>
+<span class="hl-kw">struct</span> pthread {
+    <span class="hl-co">/* ... 많은 필드들 ... */</span>
+    
+    <span class="hl-co">/* 각종 thread 상태 */</span>
+    <span class="hl-kw">pid_t</span> tid;
+    <span class="hl-kw">pid_t</span> pid_ununsed;
+    
+    <span class="hl-co">/* TLS 관련 */</span>
+    <span class="hl-kw">void</span> *dtv;
+    <span class="hl-kw">void</span> *self;
+    
+    <span class="hl-co">/* errno — TLS 의 일부 */</span>
+    <span class="hl-kw">int</span> __errno;
+    
+    <span class="hl-co">/* ... 더 많은 필드들 ... */</span>
+};</code></pre>
+<p>FS.base (x86_64) 또는 TPIDR_EL0 (ARM64) 가 이 <code class="inline-code">struct pthread</code> 의 시작 주소를 가리킨다. <code class="inline-code">__errno_location()</code> 은 그 안의 <code class="inline-code">__errno</code> 멤버의 주소를 반환한다.</p>
+<pre class="code-block lang-text"><code>[메모리 레이아웃 — Thread Control Block]
+
+  FS.base ──┐
+            ▼
+        ┌───────────────────────────┐
+        │ struct pthread            │
+        │ ┌───────────────────────┐ │
+        │ │ tid, pid              │ │
+        │ ├───────────────────────┤ │
+        │ │ self pointer          │ │
+        │ ├───────────────────────┤ │
+        │ │ dtv (dynamic TLS)     │ │
+        │ ├───────────────────────┤ │
+        │ │ __errno     ← 이 위치  │ │
+        │ ├───────────────────────┤ │
+        │ │ ... 기타 필드들 ...     │ │
+        │ └───────────────────────┘ │
+        │                           │
+        │ TLS variables             │
+        │   (__thread 로 선언된 것들) │
+        │                           │
+        └───────────────────────────┘</code></pre>
+<p>이 영역은 각 thread 마다 별개의 메모리 할당이다. main thread 는 부팅 시 glibc 의 <code class="inline-code">__libc_setup_tls</code> 에서 만들어지고, 추가 thread 는 <code class="inline-code">pthread_create</code> 안의 <code class="inline-code">allocate_stack</code> 에서 만들어진다.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>errno 의 thread-safety 는 다음 메커니즘으로 보장된다.</p>
+<pre class="code-block lang-text"><code>1. &lt;errno.h&gt; 의 매크로
+   errno → *__errno_location()
+   
+2. 함수 __errno_location()
+   현재 thread 의 TLS 영역 안의 errno 주소 반환
+   
+3. CPU 의 segment/thread register
+   x86_64: FS register 의 base
+   ARM64: TPIDR_EL0 register
+   
+4. struct pthread (TCB)
+   각 thread 마다 별개의 메모리 할당
+   errno 는 그 안의 한 멤버
+   
+5. kernel 의 협력
+   thread 전환 시 FS.base / TPIDR_EL0 를 swap</code></pre>
+<p>이 다섯 layer 가 협력해서 — 사용자가 그냥 <code class="inline-code">errno</code> 라고 쓸 수 있게 한다. 사용자의 코드 한 줄 뒤에 매우 정교한 메커니즘이 숨어 있다.</p>
+<p>다음 장에서는 또 다른 흥미로운 user-space / kernel-space 협력 메커니즘인 vDSO 를 본다. <strong>kernel 이 user-space 안에 직접 함수를 심어놓는</strong> 신기한 메커니즘이다.</p>
+<h2 class="section-heading" id="8-vdso-kernel-이-user-space-에-직접-제공하는-코드"><span class="section-num">8</span><span class="section-title">vDSO — kernel 이 user-space 에 직접 제공하는 코드</span></h2>
+<p>이 장은 매우 흥미로운 메커니즘 — <strong>kernel 이 user-space 의 주소 공간 안에 자신의 코드를 심어놓는</strong> 것 — 을 본다. 이게 vDSO (virtual Dynamic Shared Object) 다. user-space 와 kernel-space 의 경계를 흥미로운 방식으로 깨는 디자인이다.</p>
+<h3 id="왜-필요한가-gettimeofday-의-성능-문제">왜 필요한가 — <code class="inline-code">gettimeofday</code> 의 성능 문제</h3>
+<p>문제부터 본다. <code class="inline-code">gettimeofday()</code> 는 매우 자주 호출되는 함수다. logging, profiling, animation, 게임 — 거의 모든 프로그램이 시각을 자주 묻는다. 1초에 수천 번도 호출된다.</p>
+<p>전통적인 방식이라면 이 함수도 syscall 이 된다.</p>
+<pre class="code-block lang-text"><code>[전통적 gettimeofday — syscall 경로]
+
+user-space code
+    │
+    ▼
+glibc 의 gettimeofday() wrapper
+    │
+    │ syscall 명령어
+    ▼ ═══════════════════════════════ user/kernel 경계
+kernel
+    │
+    │ sys_gettimeofday
+    │  - 현재 시각 읽기 (TSC 또는 HPET)
+    │  - struct timeval 채우기
+    │
+    ▼ sysret
+user-space code</code></pre>
+<p>문제는 — <strong>syscall 자체의 비용이 크다</strong>. 권한 전환, 레지스터 저장/복원, kernel stack 전환, security check 등이 모두 일어난다. 측정에 따르면 Intel Core i7 에서 약 90.5 마이크로초 정도 (LWN 측정값, 2014).</p>
+<p><code class="inline-code">gettimeofday</code> 의 실제 일은 매우 단순하다 — kernel 의 timekeeping 변수를 읽는 것. 사실상 메모리 읽기 한 번에 가깝다. <strong>kernel 진입 자체의 비용이 작업 비용보다 압도적으로 크다</strong>.</p>
+<p>이걸 해결할 방법은 — <strong>kernel 진입 없이도 그 변수를 읽을 수 있게</strong> 하는 것이다. 그것이 vDSO 의 동기다.</p>
+<h3 id="vdso-의-정체">vDSO 의 정체</h3>
+<p>vDSO 는 — <strong>kernel 이 컴파일 시점에 자신 안에 포함시킨, 작은 ELF shared library</strong>다. 이 library 가 시스템 부팅 시 kernel 메모리에 로드되고, 그 후 모든 process 의 주소 공간에 매핑된다.</p>
+<pre class="code-block lang-text"><code>[vDSO 의 위치]
+
+  Linux kernel binary (vmlinux)
+    │
+    │ 컴파일 시점에 vdso.so 가 안에 포함됨
+    │
+    ▼
+  부팅 시 kernel 이 vDSO 페이지를 메모리에 로드
+    │
+    ▼
+  각 process 시작 시:
+    kernel 이 vDSO 페이지를 user-space 의 주소 공간에 매핑
+    (mmap 과 비슷하지만 kernel 이 자동으로 함)
+    
+    매핑 주소는 ASLR 로 랜덤화됨 (보안)</code></pre>
+<p>각 process 의 주소 공간을 보면:</p>
+<pre class="code-block lang-text"><code>[process 의 주소 공간 — vDSO 가 매핑된 위치]
+
+  0xFFFF_FFFF_FFFF_FFFF
+            │
+            │  ╔═════════════════════════╗
+            │  ║ kernel-space              ║
+            │  ╚═════════════════════════╝
+  ─────────────────────────────────────────  ← canonical hole
+            │
+            │  ┌─────────────────────────┐
+            │  │ stack                   │ ↓
+            │  ├─────────────────────────┤
+            │  │ ★ vDSO (보통 1~2 페이지) │ ← kernel 코드가 user-space 에!
+            │  ├─────────────────────────┤
+            │  │ ld-linux.so             │
+            │  ├─────────────────────────┤
+            │  │ libc.so                 │
+            │  ├─────────────────────────┤
+            │  │ heap                    │
+            │  ├─────────────────────────┤
+            │  │ .text (사용자 프로그램)   │
+            │  └─────────────────────────┘
+            │
+  0x0000_0000_0000_0000</code></pre>
+<p>매우 흥미로운 사실은 — <strong>vDSO 는 user-space 주소에 위치한다</strong>는 점. 즉 user-space 코드가 syscall 명령어 없이 그냥 함수 호출만으로 그 코드를 실행할 수 있다.</p>
+<p>이걸 확인하는 방법은 <code class="inline-code">ldd</code> 다.</p>
+<pre class="code-block lang-bash"><code><span class="hl-co"># [user-space - bash]</span>
+<span class="hl-co">$</span> <span class="hl-fn">ldd</span> /bin/ls
+    <span class="hl-fn">linux-vdso.so.1</span> (<span class="hl-num">0x00007ffdd31be000</span>)    ← 이게 vDSO
+    <span class="hl-fn">libselinux.so.1</span> =&gt; /lib/x86_64-linux-gnu/libselinux.so.1
+    <span class="hl-fn">libc.so.6</span> =&gt; /lib/x86_64-linux-gnu/libc.so.6
+    <span class="hl-fn">...</span></code></pre>
+<p><code class="inline-code">linux-vdso.so.1</code> 이라는 가짜 이름의 shared library 가 모든 process 에 매핑되어 있다. 실제 파일 시스템에는 이 파일이 없다 — kernel binary 안에 들어있고, 메모리에만 존재한다.</p>
+<h3 id="vdso-가-제공하는-함수들">vDSO 가 제공하는 함수들</h3>
+<p>x86_64 의 vDSO 가 제공하는 함수는 다음과 같다. master 의 <code class="inline-code">arch/x86/entry/vdso/vdso.lds.S</code> 에서 확인된다.</p>
+<pre class="code-block lang-text"><code>[x86_64 vDSO 의 노출 심볼]
+
+  __vdso_gettimeofday    ← gettimeofday(2) 의 vDSO 버전
+  __vdso_clock_gettime   ← clock_gettime(2) 의 vDSO 버전
+  __vdso_time            ← time(2) 의 vDSO 버전
+  __vdso_getcpu          ← getcpu(2) 의 vDSO 버전
+  __vdso_clock_getres    ← clock_getres(2) 의 vDSO 버전
+  
+  + 별칭: gettimeofday, clock_gettime, ... (weak alias)</code></pre>
+<p>ARM64 의 vDSO 도 비슷하다 (master 의 <code class="inline-code">arch/arm64/kernel/vdso/vdso.lds.S</code>):</p>
+<pre class="code-block lang-text"><code>[ARM64 vDSO 의 노출 심볼 — master]
+
+  __kernel_clock_gettime
+  __kernel_gettimeofday
+  __kernel_clock_getres
+  __kernel_rt_sigreturn
+  __kernel_getrandom   (master 에서 비교적 최근 추가)</code></pre>
+<p>이 함수들의 공통점은 — <strong>kernel 의 read-only 데이터만 읽으면 답을 낼 수 있는 함수</strong>들이다. 시각 정보, CPU 번호 등. write 가 필요한 작업이나 보안 검증이 필요한 작업은 vDSO 로 만들 수 없다 (kernel 진입이 필요).</p>
+<h3 id="vdso-의-본체-__vdso_clock_gettime-의-구현">vDSO 의 본체 — <code class="inline-code">__vdso_clock_gettime</code> 의 구현</h3>
+<p>master 의 <code class="inline-code">arch/x86/entry/vdso/vclock_gettime.c</code> 에 vDSO 함수들의 본체가 있다. <code class="inline-code">clock_gettime</code> 의 단순화된 본체:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - arch/x86/entry/vdso/vclock_gettime.c master, 단순화]</span>
+<span class="hl-co">// 이 코드는 kernel 안에 있지만, 컴파일 시 vDSO library 로 빌드되어</span>
+<span class="hl-co">// user-space 의 주소 공간에 매핑된다.</span>
+
+#include &lt;vdso/gettime.h&gt;
+
+<span class="hl-kw">extern</span> <span class="hl-kw">struct</span> vdso_data _vdso_data;    <span class="hl-co">/* kernel 이 갱신하는 read-only 데이터 */</span>
+
+<span class="hl-kw">int</span> <span class="hl-fn">__vdso_clock_gettime</span>(clockid_t clock, <span class="hl-kw">struct</span> timespec *ts)
+{
+    <span class="hl-kw">return</span> <span class="hl-fn">__cvdso_clock_gettime</span>(clock, ts);
+    <span class="hl-co">// ↑ 실제 본체는 lib/vdso/gettimeofday.c 의 generic 코드</span>
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">clock_gettime</span>(clockid_t, <span class="hl-kw">struct</span> timespec *)
+    <span class="hl-kw">__attribute__</span>((weak, <span class="hl-fn">alias</span>(<span class="hl-str">&quot;__vdso_clock_gettime&quot;</span>)));</code></pre>
+<p><code class="inline-code">__cvdso_clock_gettime</code> 의 내부는 <code class="inline-code">lib/vdso/gettimeofday.c</code> 에 있다 — 모든 아키텍처가 공유하는 generic 구현. 단순화하면 다음과 같다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - lib/vdso/gettimeofday.c master, 단순화]</span>
+<span class="hl-kw">static</span> __always_inline <span class="hl-kw">int</span> <span class="hl-fn">do_realtime</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> vdso_data *vd,
+                                        <span class="hl-kw">struct</span> timespec *ts)
+{
+    u32 seq;
+    u64 cycles, sec, ns;
+    
+    <span class="hl-kw">do</span> {
+        seq = <span class="hl-fn">vdso_read_begin</span>(vd);            <span class="hl-co">/* seqlock - read */</span>
+        
+        cycles = <span class="hl-fn">__arch_get_hw_counter</span>(vd);   <span class="hl-co">/* HW timer 직접 읽기 (rdtsc 등) */</span>
+        sec = vd-&gt;basetime[CLOCK_REALTIME].sec;
+        ns = ((cycles - vd-&gt;cycle_last) * vd-&gt;mult + vd-&gt;basetime[CLOCK_REALTIME].nsec) &gt;&gt; vd-&gt;shift;
+        
+    } <span class="hl-kw">while</span> (<span class="hl-fn">unlikely</span>(<span class="hl-fn">vdso_read_retry</span>(vd, seq)));  <span class="hl-co">/* seqlock - retry if write 발생 */</span>
+    
+    ts-&gt;tv_sec = sec + (ns &gt;&gt; <span class="hl-num">30</span>);
+    ts-&gt;tv_nsec = ns &amp; ((<span class="hl-num">1UL</span> &lt;&lt; <span class="hl-num">30</span>) - <span class="hl-num">1</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>핵심은 — <strong>이 코드 안에 syscall 이 없다</strong>는 점이다. <code class="inline-code">rdtsc</code> (Read Time-Stamp Counter) 같은 user-mode 에서 실행 가능한 명령어로 hardware timer 를 직접 읽는다. kernel 의 <code class="inline-code">vdso_data</code> 변수도 user-space 주소에 매핑되어 있어서 그냥 메모리 읽기로 접근 가능하다.</p>
+<h3 id="데이터-공유-vdso_data">데이터 공유 — <code class="inline-code">vdso_data</code></h3>
+<p>vDSO 코드가 시각 정보를 읽으려면 — kernel 이 그 정보를 저장해 둔 공간이 필요하다. 그 공간이 **<code class="inline-code">vdso_data</code>** 라는 구조체다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - include/vdso/datapage.h master, 단순화]</span>
+<span class="hl-kw">struct</span> vdso_data {
+    u32 seq;                <span class="hl-co">/* seqlock - 변경 감지용 */</span>
+    
+    s32 clock_mode;         <span class="hl-co">/* CLOCK_MODE_TSC, CLOCK_MODE_HVCLOCK, ... */</span>
+    u64 cycle_last;
+    u64 mask;
+    u32 mult;
+    u32 shift;
+    
+    <span class="hl-kw">struct</span> vdso_timestamp basetime[VDSO_BASES];  <span class="hl-co">/* CLOCK_REALTIME, CLOCK_MONOTONIC, ... */</span>
+    
+    s32 tz_minuteswest;
+    s32 tz_dsttime;
+    
+    u32 hrtimer_res;
+    u32 __unused;
+    
+    <span class="hl-kw">struct</span> arch_vdso_data arch_data;
+};</code></pre>
+<p>kernel 이 이 구조체를 정기적으로 갱신한다 — 시각이 바뀌면 새 값을 쓴다. 그 갱신은 <strong>seqlock</strong> 메커니즘으로 보호된다. user-space 의 vDSO 코드는 seq 값을 보고 — 만약 자기가 읽는 도중 kernel 이 값을 바꿨다면 다시 읽는다. 이게 <code class="inline-code">vdso_read_begin</code> / <code class="inline-code">vdso_read_retry</code> 의 정체다.</p>
+<pre class="code-block lang-text"><code>[vdso_data 의 메모리 매핑]
+
+  user-space 의 주소 공간:
+    
+    ┌─────────────────────────┐
+    │ vDSO 코드 (.text)        │  ← __vdso_clock_gettime 등
+    ├─────────────────────────┤
+    │ vDSO 데이터 (.data)      │  ← vdso_data 변수 (read-only)
+    │   - seq                 │
+    │   - cycle_last          │
+    │   - basetime            │
+    │   - ...                 │
+    └─────────────────────────┘
+                ↑
+                │ user-space 에서 직접 읽기 가능
+                │ (read-only 페이지)
+                │
+                │ kernel 은 별도의 mapping 으로 write 가능
+                │ (같은 physical page, kernel 매핑은 read-write)</code></pre>
+<p>같은 physical page 가 두 번 매핑된다 — user-space 에는 read-only 로, kernel-space 에는 read-write 로. kernel 이 쓰면 user-space 에서 읽는 값도 바뀐다.</p>
+<h3 id="vdso-호출의-정확한-흐름">vDSO 호출의 정확한 흐름</h3>
+<p>이제 사용자가 <code class="inline-code">clock_gettime</code> 을 호출했을 때 정확히 무엇이 일어나는지 본다.</p>
+<pre class="code-block lang-text"><code>[clock_gettime 호출 — vDSO 경로]
+
+  user-space (사용자 코드):
+    clock_gettime(CLOCK_REALTIME, &amp;ts);
+         │
+         ▼
+  
+  user-space (glibc):
+    clock_gettime 함수가 vDSO 의 __vdso_clock_gettime 으로 점프
+    (glibc 가 부팅 시 vDSO 의 주소를 찾아둠)
+         │
+         ▼
+  
+  user-space (vDSO, kernel 이 매핑해 둔 코드):
+    __vdso_clock_gettime(CLOCK_REALTIME, ts)
+      → __cvdso_clock_gettime(...)
+        → do_realtime(&amp;vdso_data, ts) {
+            seq = vd-&gt;seq;
+            cycles = rdtsc();              ← CPU 명령어로 직접 timer 읽기
+            sec = vd-&gt;basetime[CLOCK_REALTIME].sec;
+            ns = (cycles - vd-&gt;cycle_last) * vd-&gt;mult ...;
+            if (vd-&gt;seq != seq) retry;
+            ts-&gt;tv_sec = sec + ...;
+            ts-&gt;tv_nsec = ns ...;
+            return 0;
+          }
+         │
+         ▼
+  
+  user-space (사용자 코드):
+    함수 반환, ts 에 시각이 들어있음</code></pre>
+<p><strong>syscall 이 한 번도 일어나지 않았다</strong>. kernel 코드가 실행되긴 했지만, 그건 user-space 의 주소 공간에 매핑된 kernel 코드가 user-space 의 권한 수준에서 실행된 것이다. Ring 3 에서 모든 일이 끝났다.</p>
+<p>LWN 의 측정에 따르면 (Intel Core i7, 2014):</p>
+<pre class="code-block lang-text"><code>[gettimeofday 비용 비교]
+
+  전통적 syscall 경로:    약 90.5 마이크로초
+  vDSO 경로:             약 22.3 마이크로초
+  
+  → vDSO 가 약 4배 빠름</code></pre>
+<p>이 차이가 1초에 수천 번 호출되는 시각 함수에 큰 영향을 미친다.</p>
+<h3 id="glibc-가-vdso-를-찾는-방법">glibc 가 vDSO 를 찾는 방법</h3>
+<p>마지막 의문 — glibc 가 vDSO 의 주소를 어떻게 아는가? ASLR 로 랜덤화되어 있는데?</p>
+<p>답은 <strong>ELF auxiliary vector (auxv)</strong> 에 있다. process 가 시작될 때 — kernel 이 stack 위에 환경 변수와 argv 외에 추가 정보를 올려놓는다. 그 안에 <code class="inline-code">AT_SYSINFO_EHDR</code> 라는 항목이 있는데, 그게 vDSO 의 시작 주소다.</p>
+<pre class="code-block lang-text"><code>[process 시작 시점의 stack 위쪽]
+
+  high address
+    ┌──────────────────────────┐
+    │ environment strings       │
+    ├──────────────────────────┤
+    │ argv strings              │
+    ├──────────────────────────┤
+    │ auxiliary vector (auxv)   │
+    │   AT_PHDR        = ...   │
+    │   AT_PHENT       = ...   │
+    │   AT_PHNUM       = ...   │
+    │   ★ AT_SYSINFO_EHDR = vDSO 의 주소 │
+    │   AT_HWCAP       = ...   │
+    │   AT_NULL                 │
+    ├──────────────────────────┤
+    │ envp[] pointers           │
+    ├──────────────────────────┤
+    │ argv[] pointers           │
+    ├──────────────────────────┤
+    │ argc                      │
+    └──────────────────────────┘
+  low address (rsp 가 가리키는 곳)</code></pre>
+<p>glibc 의 시작 코드 (<code class="inline-code">__libc_start_main</code> 안) 가 이 auxv 를 파싱해서 <code class="inline-code">AT_SYSINFO_EHDR</code> 의 값을 읽는다. 그게 vDSO 의 ELF header 주소. 거기서부터 symbol table 을 읽어서 <code class="inline-code">__vdso_clock_gettime</code> 같은 함수의 주소를 찾는다.</p>
+<p><code class="inline-code">getauxval(3)</code> 함수로 user-space 에서도 직접 읽을 수 있다.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - getauxval 로 vDSO 주소 확인]</span>
+#include &lt;sys/auxv.h&gt;
+#include &lt;stdio.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> vdso = <span class="hl-fn">getauxval</span>(AT_SYSINFO_EHDR);
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;vDSO base: 0x%lx\n&quot;</span>, vdso);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}
+
+<span class="hl-co">// 실행 예:</span>
+<span class="hl-co">//   vDSO base: 0x7ffdd31be000</span></code></pre>
+<p>매번 실행할 때마다 다른 주소가 나온다 (ASLR).</p>
+<h3 id="vdso-가-아닌-syscall-의-차이">vDSO 가 아닌 syscall 의 차이</h3>
+<p>모든 함수가 vDSO 로 만들어지지 않는다. 다음 조건을 만족해야 vDSO 화 가능:</p>
+<pre class="code-block lang-text"><code>[vDSO 화 가능한 함수의 조건]
+
+  ✓ read-only 데이터만 접근
+  ✓ side effect 없음 (또는 user-space 상태에만 영향)
+  ✓ 보안 검증 불필요
+  ✓ kernel resource 갱신 불필요
+  ✓ blocking 없음
+  
+  → 예: gettimeofday, clock_gettime, getcpu, time
+
+[vDSO 화 불가능한 함수]
+
+  ✗ kernel 자원에 write
+  ✗ 권한 검증 필요
+  ✗ blocking 가능
+  ✗ I/O 가 일어남
+  ✗ scheduler 와의 상호작용
+  
+  → 예: read, write, open, fork, ...</code></pre>
+<p>따라서 대부분의 syscall 은 여전히 진정한 syscall 이고, 그것이 정상이다. vDSO 는 매우 특정 카테고리의 함수 — 자주 호출되며 본질적으로 read-only 인 — 에만 적용된다.</p>
+<h3 id="비슷한-메커니즘들-vsyscall-vvar-kernel-org-페이지">비슷한 메커니즘들 — vsyscall, vvar, kernel.org 페이지</h3>
+<p>vDSO 이전에도 비슷한 시도들이 있었다.</p>
+<pre class="code-block lang-text"><code>[kernel 이 user-space 에 코드/데이터를 노출하는 메커니즘들]
+
+  vsyscall (옛, deprecated):
+    - 고정된 주소 (0xffffffffff600000) 에 코드 매핑
+    - 보안 취약 (ROP 공격에 악용 가능)
+    - 현재는 emulation 모드로만 남아있음
+  
+  vDSO (현재):
+    - ASLR 로 랜덤화된 주소
+    - ELF shared library 형태
+    - master 가 권장
+  
+  vvar (vDSO 의 일부):
+    - vdso_data 가 매핑되는 페이지
+    - read-only
+    - kernel 이 갱신, user 가 읽기만</code></pre>
+<p><code class="inline-code">/proc/&lt;pid&gt;/maps</code> 를 보면 vsyscall 의 흔적이 보인다.</p>
+<pre class="code-block lang-bash"><code><span class="hl-co"># [user-space - bash]</span>
+<span class="hl-co">$</span> <span class="hl-fn">cat</span> /proc/self/maps | <span class="hl-fn">grep</span> -E <span class="hl-str">&quot;vdso|vsyscall|vvar&quot;</span>
+    <span class="hl-num">7ffdd31be000</span>-<span class="hl-num">7ffdd31c0000</span> r-xp <span class="hl-num">00000000</span> <span class="hl-num">00</span>:<span class="hl-num">00</span> <span class="hl-num">0</span>     [vdso]
+    <span class="hl-num">7ffdd31bc000</span>-<span class="hl-num">7ffdd31be000</span> r--p <span class="hl-num">00000000</span> <span class="hl-num">00</span>:<span class="hl-num">00</span> <span class="hl-num">0</span>     [vvar]
+    <span class="hl-fn">ffffffffff600000-ffffffffff601000</span> --xp ...          [vsyscall]</code></pre>
+<p><code class="inline-code">[vdso]</code> 페이지가 vDSO 의 코드, <code class="inline-code">[vvar]</code> 가 그것이 읽는 데이터, <code class="inline-code">[vsyscall]</code> 가 historical 한 호환성용 페이지다.</p>
+<h3 id="이-장의-결론-part-i-의-결론">이 장의 결론 — Part I 의 결론</h3>
+<p>vDSO 는 user-space 와 kernel-space 의 경계를 우아하게 깨는 메커니즘이다.</p>
+<pre class="code-block lang-text"><code>[Part I 에서 본 user-space / kernel-space 의 경계]
+
+  전통적 경계 (Chapter 3 ~ 7):
+    Ring 3 ⇄ Ring 0 전환은 오직 syscall 명령어로만
+    각 공간은 별개의 메모리 보호
+    
+  vDSO 는 그 경계의 흥미로운 예외:
+    kernel 의 코드와 데이터가 user-space 주소 공간에 매핑
+    syscall 없이도 일부 kernel 함수를 실행
+    단, user-space 권한 (Ring 3) 으로만 실행
+    
+  → 권한 레벨은 그대로지만, 코드의 위치는 다른 영역</code></pre>
+<p>Part I 에서 본 모든 사실을 정리하면 다음과 같다.</p>
+<pre class="code-block lang-text"><code>1. CPU 의 권한 레벨 (Ring/EL) 이 user-space / kernel-space 의 물리적 근거
+2. syscall 명령어 (또는 svc, ecall) 가 권한 전환의 유일한 통로
+3. 아키텍처마다 다른 명령어와 register 규약
+4. Linux 의 syscall ABI 가 일반 함수 ABI 와 미묘하게 다름 (r10 vs rcx)
+5. errno 의 음수 인코딩 (-4095 ~ -1)
+6. kernel 의 syscall.tbl + SYSCALL_DEFINE + sys_call_table dispatch
+7. errno 의 thread-local 구현 (FS register, TLS)
+8. vDSO — kernel 코드를 user-space 에 직접 매핑</code></pre>
+<p>이 8 개의 사실이 user-space 와 kernel-space 의 경계를 완전히 설명한다. 다음 Part 부터는 — 이 경계 위에서 libc 가 무엇을 하는지, 그리고 그 위에 어떤 추상화를 쌓는지 — 본다.</p>
+<hr>
+<nav class="part-nav part-nav-bottom"><span class="nav-link nav-disabled"></span><a href="index.html" class="nav-hub">libc 허브</a><a href="part2.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part II</span><span class="nav-title">libc 의 정체</span></span><span class="nav-arrow">→</span></a></nav>
+</main>
+</div>
+<script src="../assets/script.js"></script>
+</body>
+</html>

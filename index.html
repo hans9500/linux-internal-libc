@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Internals — 시스템 깊이 학습 가이드</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle">🌙 Dark</button>
+<main class="content content-hub">
+<div class="doc-header"><div class="doc-eyebrow">Hans9500</div><h1 class="doc-title">System Internals</h1><div class="doc-subtitle">시스템 깊이 학습 가이드 모음</div></div>
+
+<p>OS, 런타임, 그리고 시스템 라이브러리의 깊이를 — 공식 소스로 검증해 한국어로 정리한 학습 문서 모음이다. 각 문서는 독립적이고, 실제 master 브랜치의 소스 코드를 인용 / 검증한다.</p>
+
+<div class="doc-cards"><a href="libc/index.html" class="doc-card"><div class="doc-card-label">Document 01</div><div class="doc-card-title">libc 깊이 이해</div><div class="doc-card-subtitle">C 라이브러리부터 언어 runtime 까지</div><div class="doc-card-body">user-space / kernel-space 의 경계에서 시작해 libc 의 정체, program startup, malloc, stdio, pthread, dynamic linker 까지. 7개 Part 로 분할.</div><div class="doc-card-meta">62 chapters · 7 Parts · Verified against glibc master</div></a><a href="pid/index.html" class="doc-card"><div class="doc-card-label">Document 02</div><div class="doc-card-title">Linux 부팅과 PID 0/1/2</div><div class="doc-card-subtitle">단계별 학습 가이드</div><div class="doc-card-body">Linux 커널이 부팅되어 첫 사용자 프로세스가 실행되기까지의 흐름. main 함수의 정체, start_kernel, PID 0/1/2 의 정체, PID namespace, container 의 PID 1 까지. 단일 페이지.</div><div class="doc-card-meta">57 sections · Stage 0~7 + Appendix · Verified against kernel master</div></a></div>
+</main>
+<script src="assets/script.js"></script>
+</body>
+</html>

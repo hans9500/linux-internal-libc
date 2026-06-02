@@ -1,0 +1,4365 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libc 깊이 — Part VI: pthread 의 깊이</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<button id="theme-toggle" class="theme-toggle">🌙 Dark</button>
+<div class="layout">
+<aside class="sidebar"><nav class="toc" aria-label="목차"><div class="sidebar-section sidebar-home"><a href="../index.html" class="home-link">← System Internals 홈</a></div><div class="sidebar-section"><div class="toc-title">Parts</div><ul class="part-nav-list"><li><a href="part1.html" class="part-nav-link"><span class="part-nav-num">Part I</span><span class="part-nav-text">기초</span></a></li><li><a href="part2.html" class="part-nav-link"><span class="part-nav-num">Part II</span><span class="part-nav-text">libc 의 정체</span></a></li><li><a href="part3.html" class="part-nav-link"><span class="part-nav-num">Part III</span><span class="part-nav-text">_start 부터 main 까지</span></a></li><li><a href="part4.html" class="part-nav-link"><span class="part-nav-num">Part IV</span><span class="part-nav-text">malloc 의 깊이</span></a></li><li><a href="part5.html" class="part-nav-link"><span class="part-nav-num">Part V</span><span class="part-nav-text">stdio 의 깊이</span></a></li><li><a href="part6.html" class="part-nav-link part-nav-current"><span class="part-nav-num">Part VI</span><span class="part-nav-text">pthread 의 깊이</span></a></li><li><a href="part7.html" class="part-nav-link"><span class="part-nav-num">Part VII</span><span class="part-nav-text">dynamic linker</span></a></li></ul></div><div class="sidebar-section"><div class="toc-title">Contents</div><ul class="toc-list"><li class="toc-sec"><a href="#43-pthread-의-정체-kernel-thread-와의-관계"><span class="toc-num">43</span><span class="toc-label">pthread 의 정체</span></a></li><li class="toc-sec"><a href="#44-pthread_create-pthread_join"><span class="toc-num">44</span><span class="toc-label">pthread_create / pth…</span></a></li><li class="toc-sec"><a href="#45-mutex-가장-기본의-lock"><span class="toc-num">45</span><span class="toc-label">mutex</span></a></li><li class="toc-sec"><a href="#46-condition-variable-wait-signal-메커니즘"><span class="toc-num">46</span><span class="toc-label">condition variable</span></a></li><li class="toc-sec"><a href="#47-read-write-lock-spinlock-barrier"><span class="toc-num">47</span><span class="toc-label">read-write lock, spi…</span></a></li><li class="toc-sec"><a href="#48-semaphore-counting-동기화"><span class="toc-num">48</span><span class="toc-label">semaphore</span></a></li><li class="toc-sec"><a href="#49-tls-thread-local-storage"><span class="toc-num">49</span><span class="toc-label">Thread-Local Storage</span></a></li><li class="toc-sec"><a href="#50-cancellation-의-위험성"><span class="toc-num">50</span><span class="toc-label">cancellation 의 위험성</span></a></li><li class="toc-sec"><a href="#51-nptl-glibc-의-thread-구현"><span class="toc-num">51</span><span class="toc-label">NPTL</span></a></li><li class="toc-sec"><a href="#52-futex-동기화의-kernel-primitives"><span class="toc-num">52</span><span class="toc-label">futex</span></a></li></ul></div></nav></aside>
+<main class="content">
+<nav class="part-nav part-nav-top"><a href="part5.html" class="nav-link nav-prev" rel="prev"><span class="nav-arrow">←</span><span class="nav-meta"><span class="nav-label">Part V</span><span class="nav-title">stdio 의 깊이</span></span></a><a href="index.html" class="nav-hub">libc 허브</a><a href="part7.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part VII</span><span class="nav-title">dynamic linker</span></span><span class="nav-arrow">→</span></a></nav>
+<div class="doc-header"><div class="doc-eyebrow">libc internals</div><h1 class="doc-title">Part VI — pthread 의 깊이</h1><div class="doc-subtitle">동시성의 정체</div><div class="doc-meta"><span>43~52장</span><span>10 chapters</span><span>Verified against glibc master</span></div></div>
+<h1 class="stage-heading" id="part-vi-pthread-의-깊이-동시성의-정체"><span class="stage-label">Part VI</span><span class="stage-title">pthread 의 깊이 — 동시성의 정체</span></h1>
+<p>Part I~V 에서 — 단일 thread 의 모든 메커니즘을 봤다. 이제 — <strong>multi-thread</strong> 의 세계로.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+#include &lt;pthread.h&gt;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-co">/* 다른 thread 가 동시에 실행 */</span>
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t;
+    <span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t, <span class="hl-kw">NULL</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>이 단순한 코드 — <code class="inline-code">pthread_create</code> 한 줄 뒤에 정교한 메커니즘이.</p>
+<pre class="code-block lang-text"><code>[pthread_create 한 줄의 일생]
+
+  pthread_create 호출
+       │
+       ▼
+  thread stack 할당 (mmap)
+       │
+       ▼
+  TLS (Thread-Local Storage) 설정
+       │
+       ▼
+  pthread_attr_t 처리 (size, detach, sched policy 등)
+       │
+       ▼
+  clone(2) syscall — 새 task_struct 생성
+       │
+       ▼
+  kernel 이 새 thread 추가 (같은 PID 의 다른 TID)
+       │
+       ▼
+  새 thread 가 worker() 진입
+       │
+       ▼
+  worker return → pthread_exit
+       │
+       ▼
+  cleanup (TSD destructor, cancellation 처리, stack 해제)
+       │
+       ▼
+  exit syscall — kernel 의 task 종료</code></pre>
+<p>Part VI 의 학습 목표:</p>
+<pre class="code-block lang-text"><code>[Part VI 의 학습 목표]
+
+  ✓ Linux 의 thread 모델 (task_struct, tid vs pid)
+  ✓ pthread_create / pthread_join 의 내부
+  ✓ mutex 의 동작 (futex 와의 관계)
+  ✓ condition variable 의 정확한 사용
+  ✓ read-write lock, spinlock, barrier
+  ✓ semaphore (POSIX)
+  ✓ TLS — __thread 와 pthread_key
+  ✓ cancellation 의 위험성
+  ✓ NPTL (glibc 의 thread 구현)
+  ✓ futex — 동기화의 kernel primitives</code></pre>
+<p>Part VI 가 끝나면 — <code class="inline-code">pthread_mutex_lock</code> 한 줄 뒤의 모든 메커니즘이 보인다. user-space 의 atomic 부터, futex syscall, kernel 의 wait queue, scheduler 의 wakeup 까지.</p>
+<h2 class="section-heading" id="43-pthread-의-정체-kernel-thread-와의-관계"><span class="section-num">43</span><span class="section-title">pthread 의 정체 — kernel thread 와의 관계</span></h2>
+<p>C 의 thread 가 — kernel 의 어떤 entity 와 매핑되는가? Linux 의 답은 — <strong>task_struct</strong>. process 도 thread 도 같은 자료구조.</p>
+<h3 id="두-가지-관점-kernel-vs-posix">두 가지 관점 — kernel vs POSIX</h3>
+<pre class="code-block lang-text"><code>[두 가지 thread 관점]
+
+  POSIX 의 관점:
+    process = 자원 컨테이너
+    thread = 실행 context (한 process 안에 여러 개)
+    pthread_create → 새 thread (자원 공유)
+    fork → 새 process (자원 복사)
+    
+  Linux kernel 의 관점:
+    task = 실행 단위 (실제 자료구조: task_struct)
+    process vs thread 의 구분 없음 — 둘 다 task
+    각자 자원 공유 정도가 다를 뿐
+    clone(2) 의 flags 가 공유 정도 결정</code></pre>
+<p>이 차이가 — Linux 의 독특한 디자인. 흔히 — &quot;Linux 의 thread 는 process 다&quot; 라고 표현.</p>
+<h3 id="task_struct-모든-것의-단위">task_struct — 모든 것의 단위</h3>
+<p>Linux kernel 의 핵심 자료구조 <code class="inline-code">task_struct</code> 가 — <strong>process 도 thread 도 표현</strong>.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - linux/include/linux/sched.h master 단순화]</span>
+<span class="hl-kw">struct</span> task_struct {
+    <span class="hl-co">/* state */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span>     __state;
+    
+    <span class="hl-co">/* identifiers */</span>
+    <span class="hl-kw">pid_t</span>            pid;         <span class="hl-co">/* ★ thread id (TID) */</span>
+    <span class="hl-kw">pid_t</span>            tgid;        <span class="hl-co">/* ★ thread group id = process id (PID) */</span>
+    
+    <span class="hl-co">/* parent / children */</span>
+    <span class="hl-kw">struct</span> task_struct *real_parent;
+    <span class="hl-kw">struct</span> task_struct *parent;
+    <span class="hl-kw">struct</span> list_head children;
+    <span class="hl-kw">struct</span> list_head sibling;
+    
+    <span class="hl-co">/* address space */</span>
+    <span class="hl-kw">struct</span> mm_struct *mm;          <span class="hl-co">/* 가상 메모리 — thread 들 공유 */</span>
+    
+    <span class="hl-co">/* file system */</span>
+    <span class="hl-kw">struct</span> fs_struct *fs;          <span class="hl-co">/* cwd, umask */</span>
+    <span class="hl-kw">struct</span> files_struct *files;    <span class="hl-co">/* open fd table */</span>
+    
+    <span class="hl-co">/* signal handling */</span>
+    <span class="hl-kw">struct</span> sighand_struct *sighand;
+    <span class="hl-kw">struct</span> signal_struct *signal;
+    
+    <span class="hl-co">/* scheduling */</span>
+    <span class="hl-kw">int</span> prio, static_prio, normal_prio;
+    <span class="hl-kw">struct</span> sched_class *sched_class;
+    
+    <span class="hl-co">/* ... 수백 개의 필드 */</span>
+};</code></pre>
+<p>핵심 — <strong>pid (TID) 와 tgid (PID) 의 분리</strong>.</p>
+<pre class="code-block lang-text"><code>[pid vs tgid 의 차이]
+
+  Linux kernel 내부:
+    pid  = 개별 task 의 id (실제로는 TID 의미)
+    tgid = thread group id (같은 process 의 thread 들이 공유)
+    
+  POSIX 의 호환:
+    getpid() → tgid 반환 (사용자에게 보이는 process id)
+    gettid() → pid 반환 (실제 thread id)
+    
+  같은 process 의 thread 들:
+    각자 pid 다름
+    그러나 tgid 같음 (대표 thread 의 pid 와 같음)
+    
+  process 단일 thread 일 때:
+    pid = tgid (대표 thread 자체)</code></pre>
+<h3 id="clone-2-모든-것의-시작"><code class="inline-code">clone(2)</code> — 모든 것의 시작</h3>
+<p>새 task 생성의 핵심 syscall.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux API]</span>
+#include &lt;sched.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">clone</span>(<span class="hl-kw">int</span> (*fn)(<span class="hl-kw">void</span> *), <span class="hl-kw">void</span> *stack, <span class="hl-kw">int</span> flags, <span class="hl-kw">void</span> *arg, ...);
+
+<span class="hl-co">/* 또는 syscall 직접: */</span>
+<span class="hl-kw">long</span> <span class="hl-fn">clone</span>(<span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> flags, <span class="hl-kw">void</span> *stack, <span class="hl-kw">int</span> *parent_tid,
+           <span class="hl-kw">int</span> *child_tid, <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> tls);</code></pre>
+<p><code class="inline-code">flags</code> 가 — <strong>공유 정도</strong> 결정. 매우 많은 flag.</p>
+<pre class="code-block lang-text"><code>[주요 clone flags]
+
+  자원 공유:
+    CLONE_VM       : 같은 가상 메모리 (★ thread 의 핵심)
+    CLONE_FS       : 같은 file system info (cwd, umask)
+    CLONE_FILES    : 같은 fd table
+    CLONE_SIGHAND  : 같은 signal handler
+    CLONE_SYSVSEM  : 같은 SysV semaphore
+    
+  thread 의미:
+    CLONE_THREAD   : 같은 thread group (tgid 공유, POSIX thread)
+    CLONE_PARENT   : 같은 parent task
+    
+  TLS / 동기화:
+    CLONE_SETTLS         : TLS 설정 (tls 인자)
+    CLONE_PARENT_SETTID  : parent 에게 child tid 전달
+    CLONE_CHILD_SETTID   : child 의 tid 메모리에 저장
+    CLONE_CHILD_CLEARTID : ★ child 종료 시 tid 위치 clear + futex wake
+                          (pthread_join 의 메커니즘!)
+    
+  기타:
+    CLONE_UNTRACED, CLONE_PTRACE, CLONE_FORK, ...</code></pre>
+<h3 id="fork-vs-pthread_create-clone-의-두-면"><code class="inline-code">fork()</code> vs <code class="inline-code">pthread_create()</code> — clone 의 두 면</h3>
+<pre class="code-block lang-text"><code>[fork() 의 clone 호출]
+
+  flags = SIGCHLD  (자식 종료 시 signal)
+         + CLONE_CHILD_SETTID
+         + CLONE_CHILD_CLEARTID
+  
+  → 거의 모든 자원 _복사_ (CLONE_VM, CLONE_FILES 등 안 set)
+  → child 의 mm_struct, files_struct 새로
+  → 다른 PID (= 다른 tgid)
+  → 새 process
+
+[pthread_create() 의 clone 호출]
+
+  flags = CLONE_VM       (가상 메모리 공유)
+        | CLONE_FS       (cwd 공유)
+        | CLONE_FILES    (fd 공유)
+        | CLONE_SIGHAND  (signal handler 공유)
+        | CLONE_THREAD   (★ 같은 thread group)
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS   (TLS 설정)
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID (★ join 메커니즘)
+  
+  → 자원 _공유_
+  → 같은 PID (= 같은 tgid)
+  → 다른 TID
+  → 새 thread</code></pre>
+<p>이 차이가 — 단지 flags 의 차이. 같은 syscall 로 둘 다 만들어진다.</p>
+<h3 id="thread-의-pid-gettid">thread 의 PID — <code class="inline-code">gettid()</code></h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux API]</span>
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+
+<span class="hl-kw">pid_t</span> <span class="hl-fn">gettid</span>(<span class="hl-kw">void</span>);              <span class="hl-co">/* Linux 의 thread id */</span>
+<span class="hl-kw">pid_t</span> <span class="hl-fn">getpid</span>(<span class="hl-kw">void</span>);              <span class="hl-co">/* process id (= tgid) */</span></code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+#include &lt;pthread.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;stdio.h&gt;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">pid_t</span> tid = <span class="hl-fn">syscall</span>(SYS_gettid);     <span class="hl-co">/* 또는 gettid() */</span>
+    <span class="hl-kw">pid_t</span> pid = <span class="hl-fn">getpid</span>();
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;Thread: tid=%d, pid=%d\n&quot;</span>, tid, pid);
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t1, t2;
+    <span class="hl-fn">pthread_create</span>(&amp;t1, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_create</span>(&amp;t2, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t1, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t2, <span class="hl-kw">NULL</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>출력 예:</p>
+<pre class="code-block lang-text"><code>Thread: tid=12345, pid=12340      ← main 의 pid
+Thread: tid=12346, pid=12340      ← 같은 pid, 다른 tid
+Thread: tid=12347, pid=12340</code></pre>
+<p><code class="inline-code">pid</code> 가 같음 — <strong>같은 process</strong>. <code class="inline-code">tid</code> 다름 — <strong>각자의 thread</strong>.</p>
+<h3 id="proc-pid-task-tid-thread-의-시각화"><code class="inline-code">/proc/PID/task/TID/</code> — thread 의 시각화</h3>
+<p><code class="inline-code">/proc</code> 에서 thread 를 볼 수 있다.</p>
+<pre class="code-block lang-bash"><code><span class="hl-co"># [user-space - bash]</span>
+<span class="hl-co">$</span> <span class="hl-fn">ps</span> -o pid,tid,comm -L -p &lt;pid&gt;
+  <span class="hl-fn">PID</span>   TID COMMAND
+<span class="hl-num">12340</span> <span class="hl-num">12340</span> myapp
+<span class="hl-num">12340</span> <span class="hl-num">12345</span> myapp
+<span class="hl-num">12340</span> <span class="hl-num">12346</span> myapp
+
+<span class="hl-co"># /proc 의 task 디렉토리</span>
+<span class="hl-co">$</span> <span class="hl-fn">ls</span> /proc/12340/task/
+<span class="hl-num">12340</span>  <span class="hl-num">12345</span>  <span class="hl-num">12346</span>
+
+<span class="hl-co"># 각 thread 의 상세 정보</span>
+<span class="hl-co">$</span> <span class="hl-fn">cat</span> /proc/12340/task/12345/status
+<span class="hl-fn">Name</span>:    myapp
+<span class="hl-fn">Tgid</span>:    <span class="hl-num">12340</span>
+<span class="hl-fn">Pid</span>:     <span class="hl-num">12345</span>        ← thread id
+<span class="hl-fn">PPid</span>:    <span class="hl-num">12300</span>
+<span class="hl-fn">...</span></code></pre>
+<h3 id="pthread_t-사용자-측의-식별자"><code class="inline-code">pthread_t</code> — 사용자 측의 식별자</h3>
+<p>POSIX 의 <code class="inline-code">pthread_t</code> 는 — kernel 의 tid 가 _아님_.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc pthreadtypes-arch.h]</span>
+<span class="hl-kw">typedef</span> <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> <span class="hl-kw">int</span> pthread_t;     <span class="hl-co">/* 보통 64-bit */</span></code></pre>
+<pre class="code-block lang-text"><code>[pthread_t 의 정체]
+
+  glibc 의 구현:
+    pthread_t 는 _struct pthread_ 의 주소
+    (thread descriptor)
+    
+  주의:
+    pthread_t 와 tid 는 _완전히 다른 식별자_
+    
+  변환:
+    pthread_t → tid: glibc 내부에서 td_desc-&gt;tid
+    tid → pthread_t: 직접 불가 (glibc 가 매핑 안 함)
+    
+  비교:
+    pthread_equal(t1, t2) 로만 비교 가능
+    == 는 표준 외 (단 glibc 는 동작)</code></pre>
+<p>이 추상화 덕에 — 다른 OS (Windows, macOS) 에서도 같은 pthread API 사용 가능.</p>
+<h3 id="thread-의-stack">thread 의 stack</h3>
+<p>각 thread 는 — <strong>자기만의 stack</strong>.</p>
+<pre class="code-block lang-text"><code>[thread stack 의 메모리 layout]
+
+  main thread:
+    초기 stack — kernel 이 줌 (보통 8 MB, ulimit 의존)
+    
+  pthread_create:
+    glibc 가 mmap 으로 새 stack 할당
+    기본 크기: 8 MB (glibc), 128 KB (musl)
+    또는 pthread_attr_setstacksize 로 지정
+    
+  stack layout:
+    +-- guard page (PROT_NONE) --+   ← overflow 탐지
+    | red zone                    |
+    +-- stack (성장 방향: 위→아래) --+
+    | thread descriptor (struct pthread) |
+    | (TCB)                       |
+    +-- TLS area                  +</code></pre>
+<p>stack 위에 — <strong>thread control block (TCB)</strong> 가 함께. <code class="inline-code">struct pthread</code> 라는 자료구조.</p>
+<h3 id="struct-pthread-thread-descriptor"><code class="inline-code">struct pthread</code> — thread descriptor</h3>
+<p>glibc 의 thread descriptor.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/descr.h master 단순화]</span>
+<span class="hl-kw">struct</span> pthread {
+    <span class="hl-co">/* TCB head (커널/CPU 가 사용) */</span>
+    <span class="hl-kw">union</span> {
+        tcbhead_t header;
+        <span class="hl-kw">void</span> *__padding[<span class="hl-num">24</span>];
+    };
+    
+    <span class="hl-co">/* multiple_threads, cancelhandling, ... */</span>
+    <span class="hl-kw">int</span> multiple_threads;
+    <span class="hl-kw">int</span> gscope_flag;
+    
+    <span class="hl-co">/* tid — kernel 의 thread id */</span>
+    <span class="hl-kw">pid_t</span> tid;
+    
+    <span class="hl-co">/* signal mask, cancellation state */</span>
+    sigset_t cancel_jmp_buf;
+    <span class="hl-kw">int</span> canceltype;
+    <span class="hl-kw">int</span> cancelstate;
+    
+    <span class="hl-co">/* TSD (Thread Specific Data) */</span>
+    <span class="hl-kw">struct</span> pthread_key_data {
+        <span class="hl-kw">uintptr_t</span> seq;
+        <span class="hl-kw">void</span> *data;
+    } specific_1stblock[PTHREAD_KEY_2NDLEVEL_SIZE];
+    
+    <span class="hl-co">/* cleanup handlers (pthread_cleanup_push) */</span>
+    <span class="hl-kw">struct</span> _pthread_cleanup_buffer *cleanup;
+    
+    <span class="hl-co">/* exit value, joining thread */</span>
+    <span class="hl-kw">void</span> *result;
+    
+    <span class="hl-co">/* 매우 많은 필드... (수백 byte) */</span>
+};</code></pre>
+<p>이 descriptor 가 — thread 의 모든 메타데이터. pthread_t 가 가리키는 곳.</p>
+<h3 id="linux-thread-모델의-역사">Linux thread 모델의 역사</h3>
+<pre class="code-block lang-text"><code>[Linux thread 의 진화]
+
+  옛 (Linux 2.0 ~):
+    LinuxThreads (Xavier Leroy, 1996)
+    각 thread 가 _진짜_ 새 process (CLONE_VM 만)
+    signal 처리 문제, getpid 가 thread 마다 다름 등 비표준
+    
+  과도기 (Linux 2.4):
+    LinuxThreads 의 개선
+    그러나 여전히 POSIX 비호환
+    
+  현대 (Linux 2.6+, 2003):
+    NPTL (Native POSIX Thread Library)
+    Red Hat 이 주도
+    glibc 2.4+ 의 기본
+    
+    kernel 의 협조:
+      - CLONE_THREAD (tgid 공유)
+      - futex (효율적 동기화)
+      - TLS 지원 (CLONE_SETTLS)
+      - tid + cleartid (join 메커니즘)</code></pre>
+<p>NPTL 의 성공이 — 현대 Linux 의 thread 가 POSIX 표준 그대로 동작하는 이유.</p>
+<h3 id="posix-vs-linux-의-미묘한-차이">POSIX vs Linux 의 미묘한 차이</h3>
+<p>POSIX 표준이 — Linux 의 thread 모델과 완전히 같지 않음.</p>
+<pre class="code-block lang-text"><code>[POSIX 와 Linux 의 차이]
+
+  POSIX:
+    process 가 자원의 단위
+    thread 는 단지 실행 컨텍스트
+    
+  Linux:
+    task 가 단위 (process 와 thread 구분 없음)
+    공유 정도가 다를 뿐
+    
+  결과적 차이:
+    ✓ Linux: 같은 process 의 thread 가 _다른 user_ 로 setuid 가능
+       (옛 LinuxThreads 의 흔적, 현재는 막혀 있음)
+    ✓ Linux: thread 마다 다른 nice 값 가능
+       (POSIX: process 단위)
+    ✓ Linux: thread 마다 다른 cgroup, namespace 가능
+       (Docker container 의 일부)
+    ✓ getpid() 가 LinuxThreads 시절엔 thread 마다 다름
+       (NPTL 부터 POSIX 호환)</code></pre>
+<h3 id="thread-와-process-의-자원-비교">thread 와 process 의 자원 비교</h3>
+<pre class="code-block lang-text"><code>[process vs thread 자원 비교]
+
+  자원                   process       thread
+  ─────────────────────────────────────────────
+  task_struct           각자          각자
+  mm_struct (가상 메모리)   다름        ★ 공유
+  files_struct (fd 표)    다름        ★ 공유
+  fs_struct (cwd, umask)  다름        ★ 공유
+  sighand_struct        다름        ★ 공유
+  stack                  각자        각자
+  TLS                    각자        각자
+  registers (CPU)        각자        각자
+  pid (kernel)          다름         다름
+  tgid                   다름        ★ 공유
+  scheduling             각자        각자
+  errno                  각자        ★ 각자 (TLS)
+  
+  공유 자원:
+    - 가상 메모리 (heap, .data, .bss, .text)
+    - file descriptor (open file 의 view)
+    - signal handler
+    - cwd, umask
+    
+  각자 가진 자원:
+    - stack
+    - register 상태
+    - TLS
+    - errno
+    - kernel 의 task_struct</code></pre>
+<p>이 차이가 — thread 의 효율성과 위험성의 근원.</p>
+<h3 id="thread-의-효율성">thread 의 효율성</h3>
+<pre class="code-block lang-text"><code>[thread 의 성능 우위]
+
+  fork() 비용:
+    mm_struct 복사 (page table copy-on-write)
+    files_struct 복사
+    fs_struct 복사
+    sighand 복사
+    → 약 50~100 μs
+    
+  pthread_create() 비용:
+    stack mmap (8 MB lazy)
+    TLS 설정
+    clone syscall (자원 공유라 빠름)
+    → 약 5~20 μs
+    
+  → thread 가 5~10 배 빠른 생성
+  → 응용에서 thread pool 으로 더 빠름</code></pre>
+<h3 id="thread-의-위험성">thread 의 위험성</h3>
+<pre class="code-block lang-text"><code>[thread 의 위험성]
+
+  데이터 race:
+    공유 메모리 → 동기화 없이 동시 접근 시 race
+    → mutex, atomic 필요
+    
+  signal 처리:
+    sighand 공유 → 어느 thread 가 signal 처리?
+    → 복잡한 규칙 (POSIX 의 specification)
+    
+  errno:
+    TLS 라 thread 간 안 섞임 ✓
+    
+  자원 누수:
+    fd table 공유 → 어느 thread 가 close 해야?
+    
+  cancellation:
+    중간에 thread 강제 종료 → 자원 누수 가능
+    → 매우 위험</code></pre>
+<h3 id="첫-thread-main-의-특별함">첫 thread (main) 의 특별함</h3>
+<p>main thread 가 — 약간 특별하다.</p>
+<pre class="code-block lang-text"><code>[main thread 의 특별함]
+
+  ✓ kernel 이 직접 만듬 (execve syscall)
+  ✓ stack 도 kernel 이 줌 (mmap 아님)
+  ✓ 다른 thread 들의 기준 (tgid 의 대표)
+  ✓ main() 의 return → exit() → 모든 thread 종료
+  
+  반면:
+  ✓ 자원은 다른 thread 와 같음
+  ✓ stack 크기 ulimit -s 따라 (기본 8 MB)
+  ✓ TID == PID (== TGID)</code></pre>
+<p>main thread 의 종료 — <strong>전체 process 종료</strong>.</p>
+<h3 id="task_struct-가-보여주는-통일된-모델"><code class="inline-code">task_struct</code> 가 보여주는 통일된 모델</h3>
+<pre class="code-block lang-text"><code>[Linux 의 통일된 task 모델]
+
+  kernel 입장에선 process / thread 구분 없음:
+    &quot;task_struct 하나가 task 하나&quot;
+    
+  공유 정도:
+    fully shared → &quot;thread&quot; 라 부름
+    nothing shared → &quot;process&quot; 라 부름
+    부분 공유도 가능 (CLONE_VM 만, 등)
+    
+  스케줄링:
+    task 단위로 스케줄 (process vs thread 무관)
+    
+  signal:
+    task 단위로 전달 가능 (tgkill)
+    또는 thread group 전체 (kill)
+    
+  /proc:
+    /proc/PID/ — process 의 root
+    /proc/PID/task/TID/ — 그 안의 thread 들</code></pre>
+<p>이 통일된 모델이 — Linux 의 단순함과 강력함의 비결.</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>pthread 의 본질:</p>
+<pre class="code-block lang-text"><code>[pthread 정리]
+
+  ✓ Linux 에서 thread = task = process (자료구조 같음)
+  ✓ task_struct: pid (TID) + tgid (PID 의 대표)
+  ✓ clone(2) syscall 이 모든 task 생성
+  ✓ flags 의 차이가 fork vs pthread 의 차이
+    - CLONE_VM, CLONE_FILES, CLONE_THREAD 등이 thread 의미
+  ✓ pthread_t 는 struct pthread 의 주소 (kernel tid 아님)
+  ✓ TCB (thread control block) 가 stack 위에
+  ✓ thread 생성 비용: process 의 5~10 배 빠름
+  ✓ 공유 자원: mm, files, sighand, cwd
+  ✓ 각자 자원: stack, register, TLS, errno
+  ✓ /proc/PID/task/TID/ 로 thread 시각화
+  ✓ NPTL (glibc 2.4+) 이 현재 표준 구현</code></pre>
+<p>다음 장에서는 — <code class="inline-code">pthread_create</code> 와 <code class="inline-code">pthread_join</code> 의 정확한 내부 동작을 본다. clone syscall 의 인자, futex 의 join, cleanup handler 의 처리.</p>
+<h2 class="section-heading" id="44-pthread_create-pthread_join"><span class="section-num">44</span><span class="section-title">pthread_create / pthread_join</span></h2>
+<p>이 장에서 — <code class="inline-code">pthread_create</code> 가 실제로 무엇을 하는지, <code class="inline-code">pthread_join</code> 이 어떻게 thread 의 종료를 기다리는지 본다.</p>
+<h3 id="pthread_create-의-api"><code class="inline-code">pthread_create</code> 의 API</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+#include &lt;pthread.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_create</span>(pthread_t *thread,
+                   <span class="hl-kw">const</span> pthread_attr_t *attr,
+                   <span class="hl-kw">void</span> *(*start_routine)(<span class="hl-kw">void</span> *),
+                   <span class="hl-kw">void</span> *arg);</code></pre>
+<pre class="code-block lang-text"><code>[인자]
+
+  thread       : 생성된 thread 의 식별자 (pthread_t)
+  attr         : 속성 (stack size, detach 등). NULL = 기본
+  start_routine: thread 가 실행할 함수
+  arg          : start_routine 의 인자</code></pre>
+<p>반환값:</p>
+<ul><li>0: 성공</li><li>양수 (errno 값): 실패 — EAGAIN, EINVAL, EPERM 등</li></ul>
+<h3 id="glibc-의-구현-7-단계">glibc 의 구현 — 7 단계</h3>
+<p>master 의 <code class="inline-code">__pthread_create_2_1</code> 의 단계:</p>
+<pre class="code-block lang-text"><code>[pthread_create 의 7 단계]
+
+  1. pthread_attr_t 의 확인
+     - stack size, guard size, scheduling policy
+     - NULL 이면 기본값
+     
+  2. stack 할당
+     - 사용자 지정 (attr-&gt;stackaddr) 아니면 자체 할당
+     - mmap 으로 PROT_READ|PROT_WRITE
+     - guard page (PROT_NONE) 추가
+     
+  3. struct pthread (TCB) 초기화
+     - stack 위에 위치
+     - TLS 영역 같이
+     - canceltype, cancelstate 등 기본값
+     
+  4. start_thread wrapper 설정
+     - 사용자의 start_routine 을 직접 호출 않음
+     - glibc 의 wrapper (start_thread) 가 호출
+     - exception 처리, cleanup 등 처리
+     
+  5. clone(2) syscall
+     - 매우 많은 flags
+     - 새 task 생성
+     - child 가 start_thread 진입
+     
+  6. parent 는 tid 받음
+     - pthread_t 에 struct pthread 의 주소 저장
+     - return
+     
+  7. child 는 start_thread 실행
+     - 사용자의 start_routine 호출
+     - 반환 시 pthread_exit 자동 호출</code></pre>
+<h3 id="실제-clone-호출-매우-많은-flags">실제 clone 호출 — 매우 많은 flags</h3>
+<p>master 의 clone flags 의 정확한 set:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_create.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">create_thread</span>(<span class="hl-kw">struct</span> pthread *pd, <span class="hl-kw">const</span> <span class="hl-kw">struct</span> pthread_attr *attr,
+              <span class="hl-kw">bool</span> *stopped_start, STACK_VARIABLES_PARMS, <span class="hl-kw">bool</span> *thread_ran)
+{
+    <span class="hl-kw">const</span> <span class="hl-kw">int</span> clone_flags = (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SYSVSEM
+                           | CLONE_SIGHAND | CLONE_THREAD
+                           | CLONE_SETTLS | CLONE_PARENT_SETTID
+                           | CLONE_CHILD_CLEARTID
+                           | <span class="hl-num">0</span>);
+    
+    <span class="hl-fn">TLS_DEFINE_INIT_TP</span>(tp, pd);
+    
+    <span class="hl-kw">if</span> (<span class="hl-fn">__clone_internal</span>(&amp;args, &amp;start_thread, pd) == -<span class="hl-num">1</span>)
+        <span class="hl-kw">return</span> errno;
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>각 flag 의 의미:</p>
+<pre class="code-block lang-text"><code>[pthread_create 의 clone flags 의미]
+
+  CLONE_VM:
+    가상 메모리 (mm_struct) 공유
+    → 모든 thread 가 같은 heap, .data, .text
+    
+  CLONE_FS:
+    file system info (cwd, umask) 공유
+    
+  CLONE_FILES:
+    file descriptor table 공유
+    → open(2) 한 fd 를 모든 thread 가 사용
+    
+  CLONE_SIGHAND:
+    signal handler 테이블 공유
+    → signal() 의 효과가 모든 thread 에
+    
+  CLONE_THREAD:
+    같은 thread group (tgid 공유)
+    → getpid() 가 모든 thread 에서 같은 값
+    → POSIX 의 process 의미
+    
+  CLONE_SYSVSEM:
+    SysV semaphore 공유 (drop_semundo 의미)
+    
+  CLONE_SETTLS:
+    TLS 의 location 설정 (tls 인자 사용)
+    → 새 thread 의 fs/gs register 가 새 TLS 가리킴
+    
+  CLONE_PARENT_SETTID:
+    parent (pd-&gt;tid) 에 child 의 tid 저장
+    → parent 가 child 의 tid 즉시 알 수 있음
+    
+  CLONE_CHILD_CLEARTID:
+    ★ child 종료 시 — 그 메모리 위치를 0 으로 clear
+    → 그리고 _futex wake_ (그 위치로)
+    → pthread_join 의 메커니즘 핵심!</code></pre>
+<p>마지막 — <code class="inline-code">CLONE_CHILD_CLEARTID</code> 가 매우 영리한 디자인. 다음 절에서 설명.</p>
+<h3 id="start_thread-glibc-의-wrapper"><code class="inline-code">start_thread</code> — glibc 의 wrapper</h3>
+<p>clone 의 child 가 — 사용자의 start_routine 을 _직접_ 호출 않음. 먼저 glibc 의 wrapper.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_create.c master 단순화]</span>
+<span class="hl-kw">static</span> <span class="hl-kw">void</span> *
+<span class="hl-fn">start_thread</span>(<span class="hl-kw">void</span> *arg)
+{
+    <span class="hl-kw">struct</span> pthread *pd = arg;
+    
+    <span class="hl-co">/* TLS 초기화 (이미 부분적으로 done) */</span>
+    ...
+    
+    <span class="hl-co">/* signal mask 설정 (parent 의 mask 상속) */</span>
+    ...
+    
+    <span class="hl-co">/* cleanup buffer 의 시작 위치 */</span>
+    not_first_call = <span class="hl-fn">setjmp</span>((<span class="hl-kw">struct</span> __jmp_buf_tag *)pd-&gt;cancelbuf);
+    
+    <span class="hl-kw">if</span> (<span class="hl-fn">__glibc_likely</span>(!not_first_call)) {
+        <span class="hl-co">/* ★ 사용자의 start_routine 호출! */</span>
+        <span class="hl-kw">void</span> *ret = pd-&gt;<span class="hl-fn">start_routine</span>(pd-&gt;arg);
+        
+        <span class="hl-co">/* 반환값 저장 (pthread_join 가 가져갈 것) */</span>
+        pd-&gt;result = ret;
+    } <span class="hl-kw">else</span> {
+        <span class="hl-co">/* cancellation 의 longjmp */</span>
+        pd-&gt;result = PTHREAD_CANCELED;
+    }
+    
+    <span class="hl-co">/* cleanup handlers 실행 */</span>
+    <span class="hl-kw">while</span> (pd-&gt;cleanup != <span class="hl-kw">NULL</span>) {
+        <span class="hl-kw">struct</span> _pthread_cleanup_buffer *this = pd-&gt;cleanup;
+        pd-&gt;cleanup = this-&gt;prev;
+        this-&gt;<span class="hl-fn">routine</span>(this-&gt;arg);
+    }
+    
+    <span class="hl-co">/* TSD destructors */</span>
+    <span class="hl-fn">__nptl_deallocate_tsd</span>();
+    
+    <span class="hl-co">/* clone 의 CLONE_CHILD_CLEARTID 가 작동:
+       이 thread 의 tid 가 든 위치를 0 으로 clear
+       + 그 위치에 futex wake 
+       → pthread_join 깨움 */</span>
+    
+    <span class="hl-co">/* exit syscall */</span>
+    <span class="hl-fn">__exit_thread</span>();
+}</code></pre>
+<p>이 wrapper 가 — <strong>여러 중요한 일</strong> 을 한다.</p>
+<pre class="code-block lang-text"><code>[start_thread 의 역할]
+
+  ✓ TLS 의 최종 초기화
+  ✓ signal mask 처리
+  ✓ setjmp 으로 cancellation 의 longjmp 기준점
+  ✓ 사용자의 start_routine 호출 + 반환값 저장
+  ✓ cleanup handlers 실행 (pthread_cleanup_push 등록)
+  ✓ TSD destructors 실행
+  ✓ exit syscall — kernel 에게 task 종료 알림</code></pre>
+<h3 id="사용자가-pthread_exit-호출하면">사용자가 <code class="inline-code">pthread_exit</code> 호출하면?</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_exit</span>(<span class="hl-kw">NULL</span>);     <span class="hl-co">/* 명시적 종료 */</span>
+    <span class="hl-co">/* 여기 도달 안 함 */</span>
+}</code></pre>
+<p><code class="inline-code">pthread_exit</code> 의 동작:</p>
+<pre class="code-block lang-text"><code>[pthread_exit 의 동작]
+
+  1. cleanup handlers 실행
+  2. TSD destructors 실행
+  3. result 저장
+  4. longjmp 으로 start_thread 의 setjmp 위치로
+  5. start_thread 가 마무리 (exit syscall)
+  
+  effectively:
+    worker return == pthread_exit(return_value)</code></pre>
+<p><code class="inline-code">worker</code> 가 그냥 <code class="inline-code">return</code> 해도 — 같은 효과. start_thread 가 결과 처리.</p>
+<h3 id="pthread_join-종료-기다림"><code class="inline-code">pthread_join</code> — 종료 기다림</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_join</span>(pthread_t thread, <span class="hl-kw">void</span> **retval);</code></pre>
+<p><code class="inline-code">thread</code> 가 종료할 때까지 _대기_. <code class="inline-code">retval</code> 에 반환값 받음.</p>
+<h3 id="pthread_join-의-내부-futex-사용"><code class="inline-code">pthread_join</code> 의 내부 — futex 사용</h3>
+<p>매우 영리한 메커니즘:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_join_common.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">__pthread_join</span>(pthread_t threadid, <span class="hl-kw">void</span> **thread_return)
+{
+    <span class="hl-kw">struct</span> pthread *pd = (<span class="hl-kw">struct</span> pthread *)threadid;
+    
+    <span class="hl-co">/* 자기 자신 join 검사 */</span>
+    <span class="hl-kw">if</span> (pd == THREAD_SELF)
+        <span class="hl-kw">return</span> EDEADLK;
+    
+    <span class="hl-co">/* 이미 detached 검사 */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">IS_DETACHED</span>(pd))
+        <span class="hl-kw">return</span> EINVAL;
+    
+    <span class="hl-co">/* 다른 join 진행 중 검사 */</span>
+    pthread_t self = THREAD_SELF;
+    <span class="hl-kw">if</span> (<span class="hl-fn">atomic_compare_exchange_strong</span>(&amp;pd-&gt;joinid, <span class="hl-kw">NULL</span>, self) == <span class="hl-num">0</span>)
+        <span class="hl-kw">return</span> EINVAL;     <span class="hl-co">/* 이미 다른 thread 가 join 중 */</span>
+    
+    <span class="hl-co">/* ★ 핵심: tid 가 0 이 될 때까지 대기 */</span>
+    <span class="hl-kw">pid_t</span> tid;
+    <span class="hl-kw">while</span> ((tid = <span class="hl-fn">atomic_load_acquire</span>(&amp;pd-&gt;tid)) != <span class="hl-num">0</span>) {
+        <span class="hl-co">/* tid 가 아직 set 되어 있음 = thread 살아있음 */</span>
+        <span class="hl-co">/* futex_wait 으로 대기 */</span>
+        <span class="hl-fn">lll_futex_wait</span>(&amp;pd-&gt;tid, tid, LLL_PRIVATE);
+        <span class="hl-co">/* 깨면 다시 loop */</span>
+    }
+    
+    <span class="hl-co">/* thread 종료됨! */</span>
+    <span class="hl-kw">if</span> (thread_return != <span class="hl-kw">NULL</span>)
+        *thread_return = pd-&gt;result;
+    
+    <span class="hl-co">/* stack, TLS, descriptor 정리 */</span>
+    <span class="hl-fn">__free_tcb</span>(pd);
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>핵심:</p>
+<pre class="code-block lang-text"><code>[pthread_join 의 메커니즘 — 매우 영리]
+
+  thread 생성 시:
+    clone 의 CLONE_CHILD_CLEARTID 사용
+    pd-&gt;tid 위치를 child_tidptr 로 지정
+    
+  child 실행 중:
+    pd-&gt;tid = (kernel 의 tid)
+    
+  child 종료 시:
+    kernel 이 pd-&gt;tid 를 0 으로 clear (★ CLONE_CHILD_CLEARTID 효과)
+    kernel 이 그 주소에 futex wake (모든 waiter 깨움)
+    
+  pthread_join:
+    while (pd-&gt;tid != 0):
+        futex_wait(&amp;pd-&gt;tid, tid)        /* tid 가 변할 때까지 대기 */
+    /* 변하면 깨어남 = thread 종료 */
+    
+  ★ 이게 매우 efficient
+    → mutex, signal 안 씀
+    → kernel 의 단일 futex
+    → race-free (atomic operation)</code></pre>
+<h3 id="pthread_detach-join-안-할-thread"><code class="inline-code">pthread_detach</code> — join 안 할 thread</h3>
+<p>join 하지 않을 thread 는 — detach 하면 자동 정리.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C API]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_detach</span>(pthread_t thread);
+
+<span class="hl-co">/* 또는 attr 에 지정 */</span>
+pthread_attr_t attr;
+<span class="hl-fn">pthread_attr_init</span>(&amp;attr);
+<span class="hl-fn">pthread_attr_setdetachstate</span>(&amp;attr, PTHREAD_CREATE_DETACHED);
+<span class="hl-fn">pthread_create</span>(&amp;t, &amp;attr, worker, <span class="hl-kw">NULL</span>);</code></pre>
+<pre class="code-block lang-text"><code>[detached thread]
+
+  joined thread:
+    종료 시 → 자원 안 풀림 (pthread_join 까지 보관)
+    pthread_join 가 자원 해제
+    
+  detached thread:
+    종료 시 → 즉시 자원 해제 (stack, TLS, descriptor 자동 free)
+    join 불가
+    
+  사용처:
+    &quot;fire and forget&quot; 패턴
+    background worker, signal handler thread 등</code></pre>
+<h3 id="자원-누수-join-또는-detach-필수">자원 누수 — join 또는 detach 필수</h3>
+<p><strong>joined 도 detached 도 아닌 thread</strong> 가 종료 안 되고 — main 이 끝나도 자원 누수 가능.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 위험 패턴]</span>
+<span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">1000</span>; i++) {
+    pthread_t t;
+    <span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-co">/* join 도 detach 도 안 함! */</span>
+    <span class="hl-co">/* worker 끝나도 stack 안 풀림 → 점점 메모리 누적 */</span>
+}
+
+<span class="hl-co">// [user-space - C 안전 패턴]</span>
+<span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">1000</span>; i++) {
+    pthread_t t;
+    <span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_detach</span>(t);     <span class="hl-co">/* 끝나면 자동 정리 */</span>
+}</code></pre>
+<h3 id="thread-종료의-두-경로">thread 종료의 두 경로</h3>
+<pre class="code-block lang-text"><code>[thread 종료 경로]
+
+  1. start_routine 의 return
+     → start_thread wrapper 가 처리
+     → return value 저장
+     → cleanup, TSD destructors
+     → exit syscall
+     
+  2. pthread_exit() 명시적 호출
+     → longjmp 으로 start_thread 의 setjmp 으로
+     → return value 저장
+     → cleanup 등
+     
+  3. main thread 의 종료
+     → 전체 process 종료 (exit_group syscall)
+     → 모든 thread 즉시 죽음 (cleanup 없이)
+     
+  4. pthread_cancel — 다른 thread 가 종료시킴
+     → cancellation point 에서 longjmp 발동
+     → 매우 위험 (50 장 참고)
+     
+  5. exit(0) — 전체 process 종료
+     → main thread 와 같음</code></pre>
+<p>마지막 두 가지 — <strong>cleanup handlers 실행 안 함</strong> 또는 <strong>부분 실행</strong>. 자원 누수 가능.</p>
+<h3 id="stack-의-자동-처리">stack 의 자동 처리</h3>
+<pre class="code-block lang-text"><code>[thread stack 의 생애]
+
+  생성:
+    pthread_create:
+      mmap(stacksize) 으로 stack 할당
+      guard page 추가
+      TCB 영역 같이 (stack 위)
+      
+  사용 중:
+    각 thread 가 자기 stack 사용
+    main thread 만 kernel 이 준 stack
+    
+  종료 시:
+    joined: pthread_join 가 munmap
+    detached: 자동 munmap (cache 활용 가능)
+    
+  stack cache:
+    glibc 가 — 자주 만들고 죽는 thread 의 stack 을 캐싱
+    → 다음 pthread_create 가 mmap 안 함
+    → 성능 향상</code></pre>
+<h3 id="pthread_attr_t-속성"><code class="inline-code">pthread_attr_t</code> — 속성</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C API]</span>
+#include &lt;pthread.h&gt;
+
+pthread_attr_t attr;
+<span class="hl-fn">pthread_attr_init</span>(&amp;attr);
+
+<span class="hl-co">/* stack size */</span>
+<span class="hl-fn">pthread_attr_setstacksize</span>(&amp;attr, <span class="hl-num">64</span> * <span class="hl-num">1024</span>);   <span class="hl-co">/* 64 KB */</span>
+
+<span class="hl-co">/* guard size */</span>
+<span class="hl-fn">pthread_attr_setguardsize</span>(&amp;attr, <span class="hl-num">4096</span>);
+
+<span class="hl-co">/* detach state */</span>
+<span class="hl-fn">pthread_attr_setdetachstate</span>(&amp;attr, PTHREAD_CREATE_DETACHED);
+
+<span class="hl-co">/* scheduling */</span>
+<span class="hl-kw">struct</span> sched_param param = {.sched_priority = <span class="hl-num">50</span>};
+<span class="hl-fn">pthread_attr_setschedparam</span>(&amp;attr, &amp;param);
+<span class="hl-fn">pthread_attr_setschedpolicy</span>(&amp;attr, SCHED_FIFO);
+<span class="hl-fn">pthread_attr_setinheritsched</span>(&amp;attr, PTHREAD_EXPLICIT_SCHED);
+
+<span class="hl-co">/* CPU affinity */</span>
+cpu_set_t cpus;
+<span class="hl-fn">CPU_ZERO</span>(&amp;cpus);
+<span class="hl-fn">CPU_SET</span>(<span class="hl-num">0</span>, &amp;cpus);
+<span class="hl-fn">pthread_attr_setaffinity_np</span>(&amp;attr, <span class="hl-kw">sizeof</span>(cpus), &amp;cpus);
+
+<span class="hl-co">/* 사용 후 free */</span>
+<span class="hl-fn">pthread_create</span>(&amp;t, &amp;attr, worker, <span class="hl-kw">NULL</span>);
+<span class="hl-fn">pthread_attr_destroy</span>(&amp;attr);</code></pre>
+<h3 id="기본-stack-size-의-함정">기본 stack size 의 함정</h3>
+<p>glibc 의 기본 — <strong>8 MB</strong>!</p>
+<pre class="code-block lang-text"><code>[기본 stack size]
+
+  glibc:    8 MB (보통 ulimit -s 따라)
+  musl:     128 KB ★ (1.1.21 이전 80 KB, 훨씬 작음)
+  Windows:  1 MB
+  Bionic:   1 MB
+  
+  주의:
+    1000 thread 생성 시:
+      glibc: 8 GB 가상 메모리 (lazy 라 실제 RSS 는 작음)
+      musl:  128 MB (현실적)
+      
+    web server 등에서 — thread 수가 매우 많으면
+    glibc 의 기본은 비현실적
+    → pthread_attr_setstacksize 로 조정</code></pre>
+<p>이게 — <strong>musl 의 thread 의 가벼움</strong>의 한 이유.</p>
+<h3 id="thread-safety-의-시작">thread-safety 의 시작</h3>
+<p>새 thread 가 시작되면 — 동기화 문제 시작.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 흔한 race condition]</span>
+<span class="hl-kw">int</span> counter = <span class="hl-num">0</span>;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">1000000</span>; i++) {
+        counter++;          <span class="hl-co">/* ★ race! */</span>
+    }
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t1, t2;
+    <span class="hl-fn">pthread_create</span>(&amp;t1, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_create</span>(&amp;t2, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t1, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t2, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;counter = %d\n&quot;</span>, counter);    <span class="hl-co">/* 2000000 아님! */</span>
+}</code></pre>
+<p><code class="inline-code">counter++</code> 가 — atomic 아님. read-modify-write 3 step. race condition 발생. 해결 — mutex 또는 atomic.</p>
+<p>다음 장부터 — 이 동기화 메커니즘을 다룬다.</p>
+<h3 id="pthread_yield-의도적-양보"><code class="inline-code">pthread_yield</code> — 의도적 양보</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">sched_yield</span>(<span class="hl-kw">void</span>);     <span class="hl-co">/* POSIX */</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_yield</span>(<span class="hl-kw">void</span>);   <span class="hl-co">/* glibc, deprecated */</span></code></pre>
+<p>현재 thread 가 — CPU 양보. scheduler 가 다른 thread 깨움.</p>
+<pre class="code-block lang-text"><code>[sched_yield 의 의미]
+
+  → 같은 우선순위의 다른 thread 가 있으면 양보
+  → 없으면 즉시 반환
+  → spinlock 의 contention 시 사용 (그러나 cond var 가 더 좋음)
+  
+  pthread_yield: glibc 의 옛 wrapper (deprecated)
+  sched_yield: POSIX 표준</code></pre>
+<h3 id="pthread_kill-thread-에-signal"><code class="inline-code">pthread_kill</code> — thread 에 signal</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_kill</span>(pthread_t thread, <span class="hl-kw">int</span> sig);</code></pre>
+<p>특정 thread 에 signal 전달. <strong>kill(pid, sig) 는 전체 process</strong> — pthread_kill 는 한 thread.</p>
+<p>내부 — Linux 의 <code class="inline-code">tgkill(tgid, tid, sig)</code> syscall.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-fn">pthread_kill</span>(worker_thread, SIGUSR1);
+<span class="hl-co">/* 정확히 worker_thread 만 SIGUSR1 받음 */</span></code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>pthread_create / join 정리:</p>
+<pre class="code-block lang-text"><code>[pthread_create / pthread_join 정리]
+
+  ✓ pthread_create 의 7 단계 (attr → stack → TCB → wrapper → clone)
+  ✓ clone 의 정확한 flags set (12 개)
+  ✓ start_thread wrapper 가 사용자 함수 호출 + 후처리
+  ✓ pthread_exit = start_routine return + 정리
+  ✓ pthread_join 의 메커니즘:
+    - CLONE_CHILD_CLEARTID 으로 tid 위치 child 종료 시 clear + futex wake
+    - join 은 그 위치 futex_wait
+    → 매우 효율적, race-free
+  ✓ pthread_detach: 자동 정리
+  ✓ join/detach 안 하면 자원 누수
+  ✓ thread 종료 경로 5 가지 (return, exit, main, cancel, exit())
+  ✓ 기본 stack: glibc 8 MB, musl 128 KB
+  ✓ pthread_kill = tgkill syscall</code></pre>
+<p>다음 장에서는 — thread 동기화의 가장 기본, <strong>mutex</strong> 를 본다. futex 의 활용으로 어떻게 lock 이 구현되는지의 깊이.</p>
+<h2 class="section-heading" id="45-mutex-가장-기본의-lock"><span class="section-num">45</span><span class="section-title">mutex — 가장 기본의 lock</span></h2>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 표준 예제]</span>
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;lock);
+<span class="hl-co">/* critical section */</span>
+<span class="hl-fn">pthread_mutex_unlock</span>(&amp;lock);</code></pre>
+<p>이 두 줄 사이의 코드 — 한 thread 만 실행. 너무도 단순해 보이지만, 그 안에 <strong>futex 와 atomic operation 의 정교한 협업</strong>.</p>
+<h3 id="mutex-의-본질">mutex 의 본질</h3>
+<pre class="code-block lang-text"><code>[mutex 의 본질]
+
+  목적:
+    여러 thread 가 동시 접근 _금지_
+    한 번에 한 thread 만 critical section
+    
+  구현:
+    user-space 의 atomic 변수 (lock state)
+    contention 시 kernel 의 futex 로 대기
+    
+  비유:
+    화장실 잠금 + 줄
+    문 잠긴지 확인 (atomic)
+    잠겨있으면 줄에 섬 (futex_wait)
+    문 열리면 깨움 (futex_wake)</code></pre>
+<h3 id="pthread_mutex_t-의-구조"><code class="inline-code">pthread_mutex_t</code> 의 구조</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/x86/bits/struct_mutex.h master]</span>
+<span class="hl-kw">struct</span> __pthread_mutex_s {
+    <span class="hl-kw">int</span> __lock;                  <span class="hl-co">/* lock state — futex word */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __count;        <span class="hl-co">/* recursive lock 의 count */</span>
+    <span class="hl-kw">int</span> __owner;                 <span class="hl-co">/* 소유 thread 의 tid */</span>
+    <span class="hl-kw">int</span> __nusers;                <span class="hl-co">/* waiter 수 */</span>
+    <span class="hl-kw">int</span> __kind;                  <span class="hl-co">/* mutex 종류 */</span>
+    <span class="hl-kw">short</span> __spins;
+    <span class="hl-kw">short</span> __elision;
+    __pthread_list_t __list;     <span class="hl-co">/* robust mutex 의 list */</span>
+};
+
+<span class="hl-kw">typedef</span> <span class="hl-kw">union</span> {
+    <span class="hl-kw">struct</span> __pthread_mutex_s __data;
+    <span class="hl-kw">char</span> __size[__SIZEOF_PTHREAD_MUTEX_T];
+    <span class="hl-kw">long</span> <span class="hl-kw">int</span> __align;
+} pthread_mutex_t;</code></pre>
+<p>핵심 필드는 — <code class="inline-code">__lock</code> (futex word) 와 <code class="inline-code">__kind</code> (type).</p>
+<h3 id="lock-의-3-상태">lock 의 3 상태</h3>
+<pre class="code-block lang-text"><code>[__lock 의 3 상태]
+
+  0: unlocked (자유)
+     아무도 안 잡음
+     
+  1: locked, no waiter
+     한 thread 가 잡음
+     기다리는 thread 없음
+     → unlock 시 syscall 불필요!
+     
+  2: locked, with waiter
+     한 thread 가 잡음
+     기다리는 thread 있음
+     → unlock 시 futex_wake 필요</code></pre>
+<p>이 영리한 디자인이 — <strong>uncontended fast path</strong> (kernel 안 가는 lock/unlock) 의 핵심.</p>
+<h3 id="pthread_mutex_lock-의-정확한-흐름"><code class="inline-code">pthread_mutex_lock</code> 의 정확한 흐름</h3>
+<p>master 의 단순화:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_mutex_lock.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">__pthread_mutex_lock</span>(pthread_mutex_t *mutex)
+{
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> type = <span class="hl-fn">PTHREAD_MUTEX_TYPE</span>(mutex);
+    
+    <span class="hl-co">/* fast path 가능한 case */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">__glibc_likely</span>(type == PTHREAD_MUTEX_TIMED_NP)) {
+        <span class="hl-co">/* PTHREAD_MUTEX_NORMAL — 가장 단순 */</span>
+        <span class="hl-fn">LLL_MUTEX_LOCK</span>(mutex);
+        <span class="hl-fn">assert</span>(mutex-&gt;__data.__owner == <span class="hl-num">0</span>);
+    } <span class="hl-kw">else</span> <span class="hl-kw">if</span> (...) {
+        <span class="hl-co">/* RECURSIVE, ERRORCHECK 등 다른 type */</span>
+        <span class="hl-kw">return</span> <span class="hl-fn">__pthread_mutex_lock_full</span>(mutex);
+    }
+    
+    <span class="hl-co">/* lock 획득 — owner 기록 */</span>
+    mutex-&gt;__data.__owner = <span class="hl-fn">THREAD_GETMEM</span>(THREAD_SELF, tid);
+    ++mutex-&gt;__data.__nusers;
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>핵심은 — <code class="inline-code">LLL_MUTEX_LOCK</code> 매크로. 이게 <strong>fast path + slow path</strong> 분기.</p>
+<h3 id="lll_lock-fast-path-의-핵심"><code class="inline-code">lll_lock</code> — fast path 의 핵심</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/nptl/lowlevellock.h master 단순화]</span>
+#define <span class="hl-fn">lll_lock</span>(futex, private) \
+    <span class="hl-kw">do</span> { \
+        <span class="hl-kw">int</span> *__futex = &amp;(futex); \
+        <span class="hl-kw">if</span> (__glibc_unlikely \
+            (<span class="hl-fn">atomic_compare_and_exchange_bool_acq</span>(__futex, <span class="hl-num">1</span>, <span class="hl-num">0</span>))) \
+            <span class="hl-fn">__lll_lock_wait</span>(__futex, private); \
+    } <span class="hl-kw">while</span> (<span class="hl-num">0</span>)</code></pre>
+<p>흐름:</p>
+<pre class="code-block lang-text"><code>[lll_lock 의 동작]
+
+  1. atomic CAS: __lock 이 0 이면 1 로 변경
+     → 성공: lock 획득, syscall 없음 (fast path) ✓
+     → 실패: 누군가 이미 lock 잡음, slow path 로
+     
+  2. slow path: __lll_lock_wait 호출
+     → futex syscall 사용
+     → kernel 의 wait queue 에 추가</code></pre>
+<p>uncontended case 의 lock — <strong>한 atomic operation</strong>. 매우 빠름. 대략 10~30 ns.</p>
+<h3 id="__lll_lock_wait-slow-path"><code class="inline-code">__lll_lock_wait</code> — slow path</h3>
+<p>contention 시 호출.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/unix/sysv/linux/lowlevellock.c master 단순화]</span>
+<span class="hl-kw">void</span>
+<span class="hl-fn">__lll_lock_wait</span>(<span class="hl-kw">int</span> *futex, <span class="hl-kw">int</span> private)
+{
+    <span class="hl-co">/* 현재 lock 상태 확인 */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">atomic_load_relaxed</span>(futex) == <span class="hl-num">2</span>)
+        <span class="hl-kw">goto</span> futex;
+    
+    <span class="hl-co">/* lock state 를 2 로 (waiter 있음) */</span>
+    <span class="hl-kw">while</span> (<span class="hl-fn">atomic_exchange_acquire</span>(futex, <span class="hl-num">2</span>) != <span class="hl-num">0</span>) {
+    futex:
+        <span class="hl-co">/* futex_wait: futex 가 2 면 대기, 변하면 깨어남 */</span>
+        <span class="hl-fn">lll_futex_wait</span>(futex, <span class="hl-num">2</span>, private);
+    }
+    <span class="hl-co">/* 깨어남 → lock 획득 시도 (atomic_exchange) */</span>
+}</code></pre>
+<p>핵심 흐름:</p>
+<pre class="code-block lang-text"><code>[__lll_lock_wait 의 동작]
+
+  1. __lock 을 2 로 만듬 (waiter 있음 표시)
+     이전 값이 0 이면 우리가 잡았음! 끝
+     아니면 누가 잡고 있음
+     
+  2. futex_wait(futex, 2):
+     &quot;__lock 이 2 면 대기&quot;
+     atomic 비교 — race 없음
+     변하면 깨어남
+     
+  3. 깨어남 → 다시 1 로 시도
+     loop</code></pre>
+<p>이 <strong>futex_wait</strong> 가 — kernel 의 wait queue 에 추가. 다른 thread 가 깨울 때까지 sleep.</p>
+<h3 id="pthread_mutex_unlock-의-흐름"><code class="inline-code">pthread_mutex_unlock</code> 의 흐름</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_mutex_unlock.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">__pthread_mutex_unlock_usercnt</span>(pthread_mutex_t *mutex, <span class="hl-kw">int</span> decr)
+{
+    <span class="hl-co">/* owner clear */</span>
+    mutex-&gt;__data.__owner = <span class="hl-num">0</span>;
+    <span class="hl-kw">if</span> (decr)
+        --mutex-&gt;__data.__nusers;
+    
+    <span class="hl-fn">LLL_MUTEX_UNLOCK</span>(mutex);
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p><code class="inline-code">LLL_MUTEX_UNLOCK</code> 매크로:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/nptl/lowlevellock.h master 단순화]</span>
+#define <span class="hl-fn">lll_unlock</span>(futex, private) \
+    <span class="hl-kw">do</span> { \
+        <span class="hl-kw">int</span> *__futex = &amp;(futex); \
+        <span class="hl-kw">int</span> __oldval = <span class="hl-fn">atomic_exchange_release</span>(__futex, <span class="hl-num">0</span>); \
+        <span class="hl-kw">if</span> (<span class="hl-fn">__glibc_unlikely</span>(__oldval &gt; <span class="hl-num">1</span>)) \
+            <span class="hl-fn">lll_futex_wake</span>(__futex, <span class="hl-num">1</span>, private); \
+    } <span class="hl-kw">while</span> (<span class="hl-num">0</span>)</code></pre>
+<p>흐름:</p>
+<pre class="code-block lang-text"><code>[lll_unlock 의 동작]
+
+  1. atomic_exchange: __lock 을 0 으로
+     이전 값을 받음
+     
+  2. 이전 값 검사:
+     1 → waiter 없었음, syscall 불필요 ✓
+     2 → waiter 있었음, futex_wake 로 한 명 깨움</code></pre>
+<p>이 디자인이 — <strong>uncontended unlock 도 syscall 없음</strong>. fast path 의 완벽함.</p>
+<h3 id="futex-syscall-kernel-의-동기화-primitive"><code class="inline-code">futex</code> syscall — kernel 의 동기화 primitive</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux API]</span>
+<span class="hl-kw">long</span> <span class="hl-fn">futex</span>(<span class="hl-kw">uint32_t</span> *uaddr, <span class="hl-kw">int</span> futex_op, <span class="hl-kw">uint32_t</span> val,
+           <span class="hl-kw">const</span> <span class="hl-kw">struct</span> timespec *timeout, <span class="hl-kw">uint32_t</span> *uaddr2,
+           <span class="hl-kw">uint32_t</span> val3);</code></pre>
+<pre class="code-block lang-text"><code>[futex 의 주요 operation]
+
+  FUTEX_WAIT:
+    *uaddr == val 이면 대기
+    아니면 즉시 EAGAIN 반환
+    → &quot;값 확인 후 대기&quot; 가 atomic
+    
+  FUTEX_WAKE:
+    uaddr 의 waiter 중 val 개 깨움
+    val == 1 이면 한 명만
+    val == INT_MAX 이면 모두
+    
+  FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET:
+    더 정교한 매칭 (특정 비트만)
+    
+  FUTEX_LOCK_PI, FUTEX_UNLOCK_PI:
+    priority inheritance</code></pre>
+<p>futex 의 천재성 — <strong>user-space 가 atomic 으로 결정</strong>, kernel 은 wait queue 만 관리.</p>
+<h3 id="4-가지-mutex-type">4 가지 mutex type</h3>
+<pre class="code-block lang-text"><code>[pthread_mutex 의 4 type]
+
+  PTHREAD_MUTEX_NORMAL (= TIMED_NP):
+    가장 단순, 가장 빠름
+    같은 thread 가 다시 lock 시도 → deadlock
+    unlock 시 owner 검사 안 함
+    
+  PTHREAD_MUTEX_RECURSIVE:
+    같은 thread 가 여러 번 lock 가능
+    count 만큼 unlock 해야 풀림
+    overhead: count 관리
+    
+  PTHREAD_MUTEX_ERRORCHECK:
+    같은 thread 의 재 lock → EDEADLK 반환
+    다른 thread 의 unlock → EPERM
+    debug 용도
+    
+  PTHREAD_MUTEX_ADAPTIVE_NP (glibc 확장):
+    contention 시 spin 먼저 (몇 cycle)
+    그 다음 futex_wait
+    short critical section 에 유리</code></pre>
+<h3 id="pthread_mutex_initializer-정적-초기화"><code class="inline-code">PTHREAD_MUTEX_INITIALIZER</code> — 정적 초기화</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 표준]</span>
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;</code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc pthreadtypes.h]</span>
+#define PTHREAD_MUTEX_INITIALIZER \
+    { { <span class="hl-num">0</span>, <span class="hl-num">0</span>, <span class="hl-num">0</span>, <span class="hl-num">0</span>, <span class="hl-num">0</span>, <span class="hl-num">0</span>, <span class="hl-num">0</span>, { <span class="hl-num">0</span>, <span class="hl-num">0</span> } } }</code></pre>
+<p>모든 필드 0 — <code class="inline-code">__lock = 0</code> (unlocked), <code class="inline-code">__kind = 0</code> (NORMAL).</p>
+<p>동적 초기화는:</p>
+<pre class="code-block lang-c"><code>pthread_mutex_t mutex;
+<span class="hl-fn">pthread_mutex_init</span>(&amp;mutex, <span class="hl-kw">NULL</span>);
+<span class="hl-co">/* ... */</span>
+<span class="hl-fn">pthread_mutex_destroy</span>(&amp;mutex);</code></pre>
+<h3 id="pthread_mutex_trylock"><code class="inline-code">pthread_mutex_trylock</code></h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_mutex_trylock</span>(pthread_mutex_t *mutex);</code></pre>
+<p>lock 시도, 안 잡혀있으면 즉시 반환.</p>
+<pre class="code-block lang-text"><code>[trylock 의 동작]
+
+  성공: 0 반환, lock 획득
+  실패: EBUSY 반환, lock 안 잡음
+  
+  fast path: atomic CAS
+    잡으면 성공, 아니면 즉시 EBUSY
+    → 거의 항상 한 atomic operation 만
+    
+  사용처:
+    deadlock 회피
+    non-blocking 시도
+    여러 lock 의 시도 (정렬 후 lock 다시)</code></pre>
+<h3 id="pthread_mutex_timedlock-시간-제한"><code class="inline-code">pthread_mutex_timedlock</code> — 시간 제한</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_mutex_timedlock</span>(pthread_mutex_t *mutex,
+                            <span class="hl-kw">const</span> <span class="hl-kw">struct</span> timespec *abstime);</code></pre>
+<p>시간 초과면 ETIMEDOUT 반환.</p>
+<p>내부 — <code class="inline-code">futex_wait</code> 의 timeout 인자 사용.</p>
+<h3 id="pthread_process_shared-프로세스-간-mutex"><code class="inline-code">PTHREAD_PROCESS_SHARED</code> — 프로세스 간 mutex</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, 프로세스 간 동기화]</span>
+pthread_mutexattr_t attr;
+<span class="hl-fn">pthread_mutexattr_init</span>(&amp;attr);
+<span class="hl-fn">pthread_mutexattr_setpshared</span>(&amp;attr, PTHREAD_PROCESS_SHARED);
+
+pthread_mutex_t *mutex = <span class="hl-fn">mmap</span>(<span class="hl-kw">NULL</span>, <span class="hl-kw">sizeof</span>(*mutex),
+                               PROT_READ|PROT_WRITE,
+                               MAP_SHARED|MAP_ANON, -<span class="hl-num">1</span>, <span class="hl-num">0</span>);
+<span class="hl-fn">pthread_mutex_init</span>(mutex, &amp;attr);
+
+<span class="hl-co">/* 이제 fork 의 child 도 같은 mutex 사용 가능 */</span></code></pre>
+<pre class="code-block lang-text"><code>[process-shared mutex]
+
+  futex 는 vm 안의 주소 기반
+  → 다른 process 의 같은 가상 메모리 영역에 접근 가능해야
+  → mmap MAP_SHARED 의 메모리에 mutex 위치
+  
+  내부:
+    private futex (FUTEX_PRIVATE_FLAG) → 안 씀
+    shared futex → 더 비싸지만 다른 process 와 공유</code></pre>
+<h3 id="pthread_mutex_robust-robust-mutex"><code class="inline-code">PTHREAD_MUTEX_ROBUST</code> — robust mutex</h3>
+<p>owner thread 가 죽으면 — 다른 thread 가 detect 가능.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+pthread_mutexattr_t attr;
+<span class="hl-fn">pthread_mutexattr_init</span>(&amp;attr);
+<span class="hl-fn">pthread_mutexattr_setrobust</span>(&amp;attr, PTHREAD_MUTEX_ROBUST);
+
+pthread_mutex_t mutex;
+<span class="hl-fn">pthread_mutex_init</span>(&amp;mutex, &amp;attr);
+
+<span class="hl-co">/* Thread A: */</span>
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mutex);
+<span class="hl-co">/* Thread A 가 죽음 */</span>
+
+<span class="hl-co">/* Thread B: */</span>
+<span class="hl-kw">int</span> ret = <span class="hl-fn">pthread_mutex_lock</span>(&amp;mutex);
+<span class="hl-kw">if</span> (ret == EOWNERDEAD) {
+    <span class="hl-co">/* owner 가 죽었음! 데이터 일관성 복구 */</span>
+    <span class="hl-fn">fix_data</span>();
+    <span class="hl-fn">pthread_mutex_consistent</span>(&amp;mutex);    <span class="hl-co">/* 표시: 정상화됨 */</span>
+}</code></pre>
+<pre class="code-block lang-text"><code>[robust mutex 의 동작]
+
+  thread 종료 시 (clone 의 set_robust_list):
+    kernel 이 robust mutex list 순회
+    각 mutex 에 OWNERDEAD 표시
+    futex_wake 으로 waiter 깨움
+    
+  lock 시:
+    OWNERDEAD 면 EOWNERDEAD 반환
+    사용자가 데이터 복구 후 pthread_mutex_consistent
+    
+  사용처:
+    DB, 중요 응용
+    crash 시도 데이터 일관성</code></pre>
+<h3 id="priority-inheritance-pi-mutex">Priority Inheritance (PI) mutex</h3>
+<p>실시간 (real-time) 응용의 필수 기능.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+pthread_mutexattr_t attr;
+<span class="hl-fn">pthread_mutexattr_init</span>(&amp;attr);
+<span class="hl-fn">pthread_mutexattr_setprotocol</span>(&amp;attr, PTHREAD_PRIO_INHERIT);
+<span class="hl-fn">pthread_mutex_init</span>(&amp;mutex, &amp;attr);</code></pre>
+<pre class="code-block lang-text"><code>[Priority Inheritance 의 의미]
+
+  문제:
+    낮은 우선순위 thread A 가 lock 잡음
+    높은 우선순위 thread B 가 lock 대기
+    중간 우선순위 thread C 가 A 를 preempt
+    → A 안 끝남 → B 도 안 됨 (priority inversion)
+    
+  해결:
+    A 가 lock 잡고 있는 동안 — A 의 우선순위를 _B 의 수준으로 임시 상승_
+    → C 가 A 를 preempt 못 함
+    → A 가 빨리 끝남 → B 가 lock 획득
+    
+  내부:
+    futex 의 FUTEX_LOCK_PI / FUTEX_UNLOCK_PI
+    kernel 이 우선순위 자동 조정</code></pre>
+<p>이 메커니즘이 — 화성 탐사선 같은 실시간 시스템의 안정성에 매우 중요.</p>
+<h3 id="lock-contention-측정">lock contention 측정</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, 측정]</span>
+#include &lt;time.h&gt;
+
+<span class="hl-kw">struct</span> timespec t1, t2;
+<span class="hl-fn">clock_gettime</span>(CLOCK_MONOTONIC, &amp;t1);
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mutex);
+<span class="hl-fn">clock_gettime</span>(CLOCK_MONOTONIC, &amp;t2);
+<span class="hl-kw">long</span> ns = (t2.tv_sec - t1.tv_sec) * <span class="hl-num">1e9</span> + (t2.tv_nsec - t1.tv_nsec);
+<span class="hl-co">/* uncontended: ~20 ns
+   contended: 수 μs ~ 수 ms */</span></code></pre>
+<pre class="code-block lang-text"><code>[lock 의 latency 분포]
+
+  uncontended fast path:
+    ~20 ns (한 atomic CAS)
+    
+  contended (다른 thread 가 잡음):
+    ~수 μs (futex_wait + scheduler 동작)
+    
+  contended + scheduler latency:
+    ~수 ms (다른 thread 가 critical section 길 때)
+    
+  → contention 회피가 성능의 핵심
+  → critical section 짧게
+  → lock granularity 신중</code></pre>
+<h3 id="mutex-의-흔한-함정">mutex 의 흔한 함정</h3>
+<pre class="code-block lang-text"><code>[mutex 함정]
+
+  ✗ pthread_mutex_init 안 함 (정적 init 아니면)
+     → undefined behavior
+     
+  ✗ pthread_mutex_destroy 안 함
+     → 메모리 누수 + kernel resource (robust list)
+     
+  ✗ recursive lock 시도 (NORMAL type)
+     → deadlock
+     
+  ✗ 다른 thread 가 unlock (NORMAL type)
+     → undefined (ERRORCHECK 면 EPERM)
+     
+  ✗ critical section 너무 큼
+     → contention 심함, 성능 저하
+     
+  ✗ lock 순서 다름 → 데드락
+     thread A: lock1, lock2
+     thread B: lock2, lock1
+     → 두 thread 가 서로 기다림
+     해결: 항상 정해진 순서로 lock
+     
+  ✗ lock 안 풀고 return / exit
+     → 다른 thread 영원히 대기
+     
+  ✗ signal handler 에서 mutex 사용
+     → deadlock 위험 (handler 가 같은 thread)
+     → async-signal-safe 안 됨</code></pre>
+<h3 id="scope-의-raii-c-의-영향">scope 의 RAII (C++ 의 영향)</h3>
+<p>C++ 에선 — RAII 로 자동 unlock.</p>
+<pre class="code-block lang-cpp"><code><span class="hl-co">// [user-space - C++ 예제]</span>
+<span class="hl-kw">std</span>::lock_guard&lt;<span class="hl-kw">std</span>::mutex&gt; <span class="hl-fn">lock</span>(mtx);
+<span class="hl-co">/* lock 자동, scope 끝나면 자동 unlock */</span></code></pre>
+<p>C 는 — 수동 unlock. 함수 중간 return 시 풀어야 함.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 안전 패턴]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">func</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;mutex);
+    
+    <span class="hl-kw">if</span> (error) {
+        <span class="hl-fn">pthread_mutex_unlock</span>(&amp;mutex);   <span class="hl-co">/* ★ 잊으면 deadlock */</span>
+        <span class="hl-kw">return</span> -<span class="hl-num">1</span>;
+    }
+    
+    <span class="hl-co">/* ... */</span>
+    
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;mutex);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}
+
+<span class="hl-co">/* 또는 cleanup attribute (GCC 확장): */</span>
+<span class="hl-kw">void</span> <span class="hl-fn">unlock_mutex</span>(pthread_mutex_t **m) { <span class="hl-fn">pthread_mutex_unlock</span>(*m); }
+
+<span class="hl-kw">int</span> <span class="hl-fn">func</span>(<span class="hl-kw">void</span>) {
+    pthread_mutex_t *m <span class="hl-kw">__attribute__</span>((<span class="hl-fn">cleanup</span>(unlock_mutex))) = &amp;mutex;
+    <span class="hl-fn">pthread_mutex_lock</span>(m);
+    
+    <span class="hl-kw">if</span> (error)
+        <span class="hl-kw">return</span> -<span class="hl-num">1</span>;     <span class="hl-co">/* 자동 unlock! */</span>
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>mutex 의 본질:</p>
+<pre class="code-block lang-text"><code>[mutex 정리]
+
+  ✓ 3 상태: 0 (unlocked), 1 (locked, no waiter), 2 (locked + waiter)
+  ✓ fast path: atomic CAS (uncontended ~20 ns)
+  ✓ slow path: futex_wait/wake (contended)
+  ✓ unlock fast path: atomic_exchange + waiter 있으면 futex_wake
+  ✓ 4 type: NORMAL, RECURSIVE, ERRORCHECK, ADAPTIVE
+  ✓ PTHREAD_MUTEX_INITIALIZER 의 정적 초기화
+  ✓ trylock, timedlock 변종
+  ✓ PROCESS_SHARED: mmap MAP_SHARED 영역에서
+  ✓ ROBUST: owner 죽으면 EOWNERDEAD
+  ✓ PRIO_INHERIT: priority inversion 방지
+  ✓ 함정: critical section 길이, lock 순서, recursive, signal handler</code></pre>
+<p>다음 장에서는 — mutex 와 짝을 이루는 <strong>condition variable</strong> — wait/signal 메커니즘을 본다.</p>
+<h2 class="section-heading" id="46-condition-variable-wait-signal-메커니즘"><span class="section-num">46</span><span class="section-title">condition variable — wait/signal 메커니즘</span></h2>
+<p>mutex 가 — &quot;한 명만&quot; 의 제어라면, condition variable 은 — &quot;조건이 충족될 때까지 대기&quot; 의 제어. 둘이 함께 — 거의 모든 동기화 패턴을 표현.</p>
+<h3 id="동기화의-두-패턴">동기화의 두 패턴</h3>
+<pre class="code-block lang-text"><code>[동기화의 기본 패턴]
+
+  Mutual exclusion (mutex):
+    &quot;이 자원은 한 명만&quot;
+    → pthread_mutex_lock / unlock
+    
+  Wait / Notify (cond variable):
+    &quot;조건이 될 때까지 대기&quot;
+    &quot;조건이 충족됐다고 알림&quot;
+    → pthread_cond_wait / signal
+    
+  거의 모든 동시성 패턴은 이 둘 의 조합</code></pre>
+<h3 id="condition-variable-의-api">condition variable 의 API</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+#include &lt;pthread.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_init</span>(pthread_cond_t *cond, <span class="hl-kw">const</span> pthread_condattr_t *attr);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_destroy</span>(pthread_cond_t *cond);
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_wait</span>(pthread_cond_t *cond, pthread_mutex_t *mutex);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_timedwait</span>(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                           <span class="hl-kw">const</span> <span class="hl-kw">struct</span> timespec *abstime);
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_signal</span>(pthread_cond_t *cond);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_broadcast</span>(pthread_cond_t *cond);</code></pre>
+<h3 id="기본-패턴">기본 패턴</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, producer-consumer]</span>
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cv  = PTHREAD_COND_INITIALIZER;
+<span class="hl-kw">int</span> data_ready = <span class="hl-num">0</span>;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">producer</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+    <span class="hl-co">/* 데이터 준비 */</span>
+    data_ready = <span class="hl-num">1</span>;
+    <span class="hl-fn">pthread_cond_signal</span>(&amp;cv);          <span class="hl-co">/* &quot;조건 충족!&quot; */</span>
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">void</span> *<span class="hl-fn">consumer</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+    <span class="hl-kw">while</span> (!data_ready)
+        <span class="hl-fn">pthread_cond_wait</span>(&amp;cv, &amp;mtx);  <span class="hl-co">/* 조건 될 때까지 대기 */</span>
+    <span class="hl-co">/* 데이터 처리 */</span>
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}</code></pre>
+<h3 id="pthread_cond_wait-의-정확한-동작"><code class="inline-code">pthread_cond_wait</code> 의 정확한 동작</h3>
+<p>매우 미묘한 함수. 3 단계가 <strong>atomic</strong> 해야 한다.</p>
+<pre class="code-block lang-text"><code>[pthread_cond_wait 의 3 단계]
+
+  1. mutex unlock
+  2. wait (sleep)
+  3. mutex relock (깨어난 후)
+  
+  ★ 1 과 2 가 atomic 해야 함!
+    아니면 race: unlock 직후 다른 thread 가 signal 보내면 missing
+    
+  POSIX 표준이 atomic 보장
+  → futex 의 magic 으로 구현</code></pre>
+<h3 id="왜-mutex-와-함께">왜 mutex 와 함께?</h3>
+<p>condition variable 은 <strong>mutex 와 함께만</strong> 사용. 이유:</p>
+<pre class="code-block lang-text"><code>[mutex 가 필요한 이유]
+
+  공유 데이터 (예: data_ready) 의 보호
+    
+  producer: data_ready = 1   ← write
+  consumer: read data_ready
+  → race condition 없이 하려면 mutex
+  
+  더 깊은 이유:
+    cond_wait 가 atomic unlock + wait 보장
+    → 사용자가 mutex 를 _이미 잡고_ 호출해야 함
+    → cond_signal 도 mutex 안에서
+    → 안 그러면 lost wakeup</code></pre>
+<h3 id="lost-wakeup-의-함정">lost wakeup 의 함정</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 잘못된 예제]</span>
+<span class="hl-co">/* mutex 없이 */</span>
+
+<span class="hl-kw">void</span> *<span class="hl-fn">consumer</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">if</span> (!data_ready)
+        <span class="hl-fn">pthread_cond_wait</span>(&amp;cv, ???);    <span class="hl-co">/* 무엇을 unlock? */</span>
+    <span class="hl-co">/* 데이터 처리 */</span>
+}
+
+<span class="hl-kw">void</span> *<span class="hl-fn">producer</span>(<span class="hl-kw">void</span> *arg) {
+    data_ready = <span class="hl-num">1</span>;
+    <span class="hl-fn">pthread_cond_signal</span>(&amp;cv);
+    <span class="hl-co">/* lost wakeup: signal 이 wait 보다 _먼저_ 도착하면 missed */</span>
+}</code></pre>
+<pre class="code-block lang-text"><code>[lost wakeup 시나리오]
+
+  1. consumer: !data_ready 검사 (false, 처음엔)
+  2. consumer: pthread_cond_wait 진입 _직전_
+  3. producer: data_ready = 1
+  4. producer: pthread_cond_signal — _아무도 대기 안 함, 무시됨_
+  5. consumer: pthread_cond_wait 진입 — _영원히 대기_
+  
+  해결:
+    mutex 로 consumer 의 검사 + wait 를 atomic 묶음
+    producer 의 set + signal 도 mutex 로 묶음</code></pre>
+<h3 id="while-loop-의-필수"><code class="inline-code">while</code> loop 의 필수</h3>
+<p><code class="inline-code">if</code> 가 _아니라_ **<code class="inline-code">while</code>** 로 검사.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 옳은 패턴]</span>
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+<span class="hl-kw">while</span> (!data_ready)             <span class="hl-co">/* ★ while, not if */</span>
+    <span class="hl-fn">pthread_cond_wait</span>(&amp;cv, &amp;mtx);
+<span class="hl-co">/* ... */</span>
+<span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);</code></pre>
+<pre class="code-block lang-text"><code>[while 이 필수인 이유]
+
+  1. spurious wakeup:
+     futex 의 구현 특성, 시그널 등으로
+     condition 충족 안 됐는데 wait 가 깨어날 수 있음
+     → 다시 검사 필요
+     
+  2. broadcast 의 경우:
+     여러 thread 가 깨어남
+     첫 thread 가 데이터 가져가면 나머지는 다시 못 가져감
+     → 검사 후 다시 wait
+     
+  3. POSIX 표준이 spurious wakeup 허용
+     &quot;wait 가 실패할 수 있음, 다시 시도&quot;
+     
+  → if 는 잠재 버그, while 가 항상 안전</code></pre>
+<h3 id="pthread_cond_t-의-구조"><code class="inline-code">pthread_cond_t</code> 의 구조</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/nptl/bits/struct_cond.h master 단순화]</span>
+<span class="hl-kw">struct</span> __pthread_cond_s {
+    __atomic_wide_counter __wseq;          <span class="hl-co">/* wait sequence number */</span>
+    __atomic_wide_counter __g1_start;      <span class="hl-co">/* group 1 의 start */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __g_refs[<span class="hl-num">2</span>];              <span class="hl-co">/* g1 / g2 의 ref count */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __g_size[<span class="hl-num">2</span>];              <span class="hl-co">/* 각 group 의 크기 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __g1_orig_size;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __wrefs;                  <span class="hl-co">/* waiter ref */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __g_signals[<span class="hl-num">2</span>];           <span class="hl-co">/* signal count per group */</span>
+};</code></pre>
+<p>매우 복잡한 자료구조 — 효율적이고 race-free 한 wait/signal 처리.</p>
+<h3 id="pthread_cond_wait-의-내부"><code class="inline-code">pthread_cond_wait</code> 의 내부</h3>
+<p>대단히 복잡한 알고리즘 (glibc 의 새 algorithm — 2017 년 도입).</p>
+<pre class="code-block lang-text"><code>[pthread_cond_wait 의 흐름 (단순화)]
+
+  1. cond 의 sequence number 기록
+  2. mutex unlock
+  3. futex_wait — sequence 변할 때까지 대기
+  4. 깨어남 (signal/broadcast/spurious)
+  5. mutex relock
+  6. return
+  
+  glibc 의 새 알고리즘:
+    - 2 개의 group (g1, g2)
+    - 새 waiter 는 g2 에
+    - signal/broadcast 는 g1 에
+    - group switch 로 starvation 방지</code></pre>
+<p>이 정교한 디자인이 — fair scheduling, broadcast 의 정확성, 동시 wait/signal 의 효율성을 모두 달성.</p>
+<h3 id="pthread_cond_signal-vs-pthread_cond_broadcast"><code class="inline-code">pthread_cond_signal</code> vs <code class="inline-code">pthread_cond_broadcast</code></h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_signal</span>(pthread_cond_t *cond);     <span class="hl-co">/* 한 명 깨움 */</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cond_broadcast</span>(pthread_cond_t *cond);  <span class="hl-co">/* 모두 깨움 */</span></code></pre>
+<pre class="code-block lang-text"><code>[signal vs broadcast]
+
+  signal:
+    waiter 중 _하나_ 만 깨움
+    어느 thread 인지는 unspecified
+    → &quot;한 자원이 가능&quot; 일 때 적합
+    예: 큐에 한 item 추가 → 한 consumer 만 받아감
+    
+  broadcast:
+    모든 waiter 깨움
+    → &quot;조건이 모두에 해당&quot; 일 때
+    예: producer 가 끝남 → 모든 consumer 알림
+    예: read-write lock 의 writer unlock
+    
+  주의: broadcast 는 thundering herd 가능
+    모든 thread 가 깨어나 mutex 잡으려 contention</code></pre>
+<h3 id="pthread_cond_timedwait-시간-제한"><code class="inline-code">pthread_cond_timedwait</code> — 시간 제한</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">struct</span> timespec ts;
+<span class="hl-fn">clock_gettime</span>(CLOCK_REALTIME, &amp;ts);
+ts.tv_sec += <span class="hl-num">5</span>;            <span class="hl-co">/* 5 초 후 timeout */</span>
+
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+<span class="hl-kw">int</span> ret;
+<span class="hl-kw">while</span> (!condition) {
+    ret = <span class="hl-fn">pthread_cond_timedwait</span>(&amp;cv, &amp;mtx, &amp;ts);
+    <span class="hl-kw">if</span> (ret == ETIMEDOUT) {
+        <span class="hl-co">/* 시간 초과 */</span>
+        <span class="hl-kw">break</span>;
+    }
+}
+<span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);</code></pre>
+<p><code class="inline-code">abstime</code> 이 <strong>절대 시간</strong> — 매우 중요. timeout 이 아니라 시간점.</p>
+<pre class="code-block lang-text"><code>[abstime 의 의미]
+
+  pthread_cond_timedwait(cv, mtx, abstime):
+    abstime 까지 대기 (절대 시간)
+    
+  잘못된 패턴:
+    while (!condition)
+        timedwait(cv, mtx, &amp;ts);    /* 매번 새 ts 안 만들면 OK */
+    
+  올바른 패턴:
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &amp;deadline);
+    deadline.tv_sec += 5;
+    while (!condition) {
+        if (timedwait(cv, mtx, &amp;deadline) == ETIMEDOUT)
+            break;
+    }
+    /* deadline 까지 spurious wakeup 들이 깨워도 — 같은 deadline 으로 다시 wait */</code></pre>
+<h3 id="pthread_condattr-clock-지정"><code class="inline-code">pthread_condattr</code> — clock 지정</h3>
+<p>기본 — <code class="inline-code">CLOCK_REALTIME</code>. wallclock 시간이라 — NTP, system clock 조정 시 영향.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, MONOTONIC clock]</span>
+pthread_condattr_t attr;
+<span class="hl-fn">pthread_condattr_init</span>(&amp;attr);
+<span class="hl-fn">pthread_condattr_setclock</span>(&amp;attr, CLOCK_MONOTONIC);
+
+pthread_cond_t cv;
+<span class="hl-fn">pthread_cond_init</span>(&amp;cv, &amp;attr);
+
+<span class="hl-co">/* 이제 timedwait 는 CLOCK_MONOTONIC 기준 */</span>
+<span class="hl-kw">struct</span> timespec ts;
+<span class="hl-fn">clock_gettime</span>(CLOCK_MONOTONIC, &amp;ts);
+ts.tv_sec += <span class="hl-num">5</span>;
+<span class="hl-fn">pthread_cond_timedwait</span>(&amp;cv, &amp;mtx, &amp;ts);</code></pre>
+<p><code class="inline-code">CLOCK_MONOTONIC</code> — 단조 증가, system clock 변경에 영향 안 받음. <strong>timeout 용으로 권장</strong>.</p>
+<h3 id="producer-consumer-의-완전한-예제">producer-consumer 의 완전한 예제</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 완전한 패턴]</span>
+#include &lt;pthread.h&gt;
+#define QUEUE_SIZE <span class="hl-num">100</span>
+
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> {
+    <span class="hl-kw">int</span> items[QUEUE_SIZE];
+    <span class="hl-kw">int</span> head, tail, count;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} bounded_queue_t;
+
+<span class="hl-kw">void</span> <span class="hl-fn">enqueue</span>(bounded_queue_t *q, <span class="hl-kw">int</span> item) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;q-&gt;mtx);
+    <span class="hl-kw">while</span> (q-&gt;count == QUEUE_SIZE)
+        <span class="hl-fn">pthread_cond_wait</span>(&amp;q-&gt;not_full, &amp;q-&gt;mtx);
+    
+    q-&gt;items[q-&gt;tail] = item;
+    q-&gt;tail = (q-&gt;tail + <span class="hl-num">1</span>) % QUEUE_SIZE;
+    q-&gt;count++;
+    
+    <span class="hl-fn">pthread_cond_signal</span>(&amp;q-&gt;not_empty);
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;q-&gt;mtx);
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">dequeue</span>(bounded_queue_t *q) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;q-&gt;mtx);
+    <span class="hl-kw">while</span> (q-&gt;count == <span class="hl-num">0</span>)
+        <span class="hl-fn">pthread_cond_wait</span>(&amp;q-&gt;not_empty, &amp;q-&gt;mtx);
+    
+    <span class="hl-kw">int</span> item = q-&gt;items[q-&gt;head];
+    q-&gt;head = (q-&gt;head + <span class="hl-num">1</span>) % QUEUE_SIZE;
+    q-&gt;count--;
+    
+    <span class="hl-fn">pthread_cond_signal</span>(&amp;q-&gt;not_full);
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;q-&gt;mtx);
+    <span class="hl-kw">return</span> item;
+}</code></pre>
+<p>이게 — 모든 producer-consumer 의 캐논. 두 개의 condition variable (full/empty) + 하나의 mutex.</p>
+<h3 id="signal-broadcast-의-정확한-위치">signal/broadcast 의 정확한 위치</h3>
+<pre class="code-block lang-text"><code>[signal/broadcast 의 위치 — mutex 잡은 채로 vs 푼 후?]
+
+  옵션 1: mutex 잡은 채로 signal
+    pthread_mutex_lock(&amp;mtx);
+    condition = true;
+    pthread_cond_signal(&amp;cv);
+    pthread_mutex_unlock(&amp;mtx);
+    
+  옵션 2: signal 후 unlock
+    pthread_mutex_lock(&amp;mtx);
+    condition = true;
+    pthread_mutex_unlock(&amp;mtx);
+    pthread_cond_signal(&amp;cv);
+    
+  POSIX 둘 다 허용:
+    옵션 1: 안전, 명확
+    옵션 2: 약간 더 빠를 수 있음 (wakeup 후 즉시 lock 가능)
+              그러나 미묘한 race 가능 (cond 객체 해제 등)
+              
+  권장: 옵션 1 (안에서)</code></pre>
+<h3 id="pthread_cond_t-의-정적-초기화"><code class="inline-code">pthread_cond_t</code> 의 정적 초기화</h3>
+<pre class="code-block lang-c"><code>pthread_cond_t cv = PTHREAD_COND_INITIALIZER;</code></pre>
+<p>기본 — <code class="inline-code">CLOCK_REALTIME</code>, private (process 내). 다른 옵션은 — <code class="inline-code">pthread_cond_init</code>.</p>
+<h3 id="condition-variable-의-함정">condition variable 의 함정</h3>
+<pre class="code-block lang-text"><code>[cond variable 함정]
+
+  ✗ if 로 검사 (spurious wakeup 미처리)
+     → while 사용
+     
+  ✗ mutex 없이 signal/broadcast 호출
+     → 일부 race 가능 (특히 신호 시점)
+     → 항상 mutex 안에서
+     
+  ✗ 다른 mutex 와 함께 wait
+     → undefined behavior
+     → 같은 cond variable 에는 항상 같은 mutex
+     
+  ✗ CLOCK_REALTIME 의 함정
+     → NTP, time set 시 영향
+     → CLOCK_MONOTONIC 권장
+     
+  ✗ wait 후 condition 안 검사
+     → 데이터 race
+     → wait 깨어난 후에도 _while_ 검사
+     
+  ✗ signal 의 fairness 가정
+     → POSIX 는 어느 thread 깨어날지 unspecified
+     → FIFO 라고 가정하면 안 됨</code></pre>
+<h3 id="performance-futex-위의-layer">performance — futex 위의 layer</h3>
+<pre class="code-block lang-text"><code>[cond variable 의 성능]
+
+  uncontended signal (waiter 없음):
+    fast path — atomic 만, syscall 없음
+    ~10 ns
+    
+  contended (waiter 있음):
+    futex_wake — 약 1 μs
+    + wake 된 thread 의 wakeup latency
+    
+  broadcast (N waiters):
+    futex_wake (FUTEX_REQUEUE) 사용
+    한 명만 진짜 깨우고, 나머지는 mutex 의 wait queue 로 이동
+    → thundering herd 방지</code></pre>
+<h3 id="pthread_cond_t-의-진화-linux-의-새-알고리즘"><code class="inline-code">pthread_cond_t</code> 의 진화 — Linux 의 새 알고리즘</h3>
+<p>glibc 2.25 (2017.2) — 매우 큰 변경. 옛 알고리즘의 정확성 문제 (lost signal, broadcast race) 해결.</p>
+<pre class="code-block lang-text"><code>[새 cond variable 알고리즘 (2017)]
+
+  옛 (~2.24):
+    futex sequence + total counter
+    broadcast 시 race condition
+    BZ#13165 등 여러 버그
+    
+  새 (2.25+):
+    2 group (g1, g2) 구조
+    sequence number atomic
+    group switch 로 starvation 방지
+    훨씬 정확
+    
+  영향:
+    옛 알고리즘에 의존한 일부 응용 깨질 수 있음
+    그러나 일반적으로 더 안정적</code></pre>
+<h3 id="eventfd-더-단순한-대안"><code class="inline-code">eventfd</code> — 더 단순한 대안</h3>
+<p>복잡한 cond variable 대신 — <code class="inline-code">eventfd</code> 가 유용한 경우.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux API]</span>
+#include &lt;sys/eventfd.h&gt;
+
+<span class="hl-kw">int</span> fd = <span class="hl-fn">eventfd</span>(<span class="hl-num">0</span>, EFD_NONBLOCK);
+
+<span class="hl-co">/* notify */</span>
+<span class="hl-kw">uint64_t</span> one = <span class="hl-num">1</span>;
+<span class="hl-fn">write</span>(fd, &amp;one, <span class="hl-kw">sizeof</span>(one));
+
+<span class="hl-co">/* wait */</span>
+<span class="hl-kw">uint64_t</span> count;
+<span class="hl-fn">read</span>(fd, &amp;count, <span class="hl-kw">sizeof</span>(count));    <span class="hl-co">/* 0 이면 block, signal 받으면 깨어남 */</span></code></pre>
+<pre class="code-block lang-text"><code>[eventfd 의 장점]
+
+  ✓ file descriptor 라 select/poll/epoll 가능
+  ✓ event-driven 응용에 자연스럽게 통합
+  ✓ counter 의 atomic 처리
+  ✓ 단순한 API
+  
+  cond variable 보다 약간 느릴 수 있지만
+  event loop 와 함께면 매우 효율적</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>condition variable 정리:</p>
+<pre class="code-block lang-text"><code>[condition variable 정리]
+
+  ✓ mutex 와 함께만 사용
+  ✓ wait 의 3 단계 (unlock, sleep, relock) — atomic 보장
+  ✓ ★ 항상 while loop 로 검사 (spurious wakeup, broadcast)
+  ✓ signal: 한 명 / broadcast: 모두
+  ✓ signal 위치: mutex 안 권장 (안전)
+  ✓ timedwait: 절대 시간 (deadline)
+  ✓ CLOCK_MONOTONIC 권장 (NTP 영향 없음)
+  ✓ glibc 2.25+: 새 알고리즘 (정확성 개선)
+  ✓ producer-consumer 의 canonical 패턴
+  ✓ eventfd 의 대안
+  ✓ futex 위의 layer (efficient)</code></pre>
+<p>다음 장에서는 — mutex 와 cond variable 의 변종들 — <strong>read-write lock, spinlock, barrier</strong> 를 본다.</p>
+<h2 class="section-heading" id="47-read-write-lock-spinlock-barrier"><span class="section-num">47</span><span class="section-title">read-write lock, spinlock, barrier</span></h2>
+<p>mutex 와 cond variable 외에도 — 특정 패턴에 더 효율적인 동기화 primitive 들이 있다. 이 장에서 — <strong>read-write lock, spinlock, barrier</strong> 세 가지를 본다.</p>
+<h3 id="read-write-lock-읽기는-동시-쓰기는-단독">read-write lock — 읽기는 동시, 쓰기는 단독</h3>
+<p>mutex 의 일반화 — <strong>읽기는 여러 thread 동시 허용</strong>, 쓰기는 한 thread.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX API]</span>
+#include &lt;pthread.h&gt;
+
+pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_rdlock</span>(pthread_rwlock_t *rwlock);    <span class="hl-co">/* read lock */</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_wrlock</span>(pthread_rwlock_t *rwlock);    <span class="hl-co">/* write lock */</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_unlock</span>(pthread_rwlock_t *rwlock);    <span class="hl-co">/* unlock */</span>
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_tryrdlock</span>(pthread_rwlock_t *rwlock);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_trywrlock</span>(pthread_rwlock_t *rwlock);</code></pre>
+<h3 id="rwlock-의-의미">rwlock 의 의미</h3>
+<pre class="code-block lang-text"><code>[rwlock 의 의미론]
+
+  read lock (여러 가능):
+    여러 thread 가 동시 보유 가능
+    데이터 _읽기_ 만 (변경 X)
+    다른 read lock 과 호환
+    write lock 과는 _아님_
+    
+  write lock (단독):
+    한 thread 만 보유
+    데이터 변경 가능
+    다른 read/write lock 과 _아님_
+    
+  → 읽기 위주 응용에 매우 효율적
+  → DB의 select vs update 같은 패턴</code></pre>
+<h3 id="예제-read-heavy-패턴">예제 — read-heavy 패턴</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> {
+    <span class="hl-kw">int</span> *data;
+    <span class="hl-kw">size_t</span> size;
+    pthread_rwlock_t lock;
+} cache_t;
+
+<span class="hl-kw">int</span> <span class="hl-fn">cache_get</span>(cache_t *c, <span class="hl-kw">int</span> key) {
+    <span class="hl-fn">pthread_rwlock_rdlock</span>(&amp;c-&gt;lock);   <span class="hl-co">/* read lock */</span>
+    <span class="hl-kw">int</span> value = <span class="hl-fn">lookup</span>(c-&gt;data, key);
+    <span class="hl-fn">pthread_rwlock_unlock</span>(&amp;c-&gt;lock);
+    <span class="hl-kw">return</span> value;
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">cache_set</span>(cache_t *c, <span class="hl-kw">int</span> key, <span class="hl-kw">int</span> value) {
+    <span class="hl-fn">pthread_rwlock_wrlock</span>(&amp;c-&gt;lock);   <span class="hl-co">/* write lock */</span>
+    <span class="hl-fn">insert</span>(c-&gt;data, key, value);
+    <span class="hl-fn">pthread_rwlock_unlock</span>(&amp;c-&gt;lock);
+}</code></pre>
+<p>100 thread 가 <code class="inline-code">cache_get</code> 하면 — 모두 동시 실행. <code class="inline-code">cache_set</code> 만 — 단독.</p>
+<h3 id="rwlock-의-정확한-동작">rwlock 의 정확한 동작</h3>
+<pre class="code-block lang-text"><code>[rwlock state machine]
+
+  states:
+    free        — 아무도 안 잡음
+    read_locked — read lock 보유 (1 명 이상)
+    write_locked — write lock 보유 (단독)
+    
+  transitions:
+    read 시도:
+      free → read_locked (1)        : 즉시 획득
+      read_locked → read_locked (++): 추가 reader
+      write_locked → wait           : write 끝날 때까지
+      
+    write 시도:
+      free → write_locked            : 즉시 획득
+      read_locked → wait             : 모든 reader 끝날 때까지
+      write_locked → wait            : 단독이므로
+      
+    unlock:
+      reader 가 0 되면 → free
+      writer 가 풀면 → free
+      waiter 깨움</code></pre>
+<h3 id="pthread_rwlock_t-의-구조"><code class="inline-code">pthread_rwlock_t</code> 의 구조</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc sysdeps/nptl/bits/struct_rwlock.h master 단순화]</span>
+<span class="hl-kw">struct</span> __pthread_rwlock_arch_t {
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __readers;             <span class="hl-co">/* reader 수 + write 비트 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __writers;             <span class="hl-co">/* pending writer 수 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __wrphase_futex;       <span class="hl-co">/* writer phase futex */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __writers_futex;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __pad3, __pad4;
+    <span class="hl-kw">int</span> __cur_writer;                   <span class="hl-co">/* 현재 writer tid */</span>
+    <span class="hl-kw">int</span> __shared;
+    <span class="hl-kw">signed</span> <span class="hl-kw">char</span> __rwelision;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">char</span> __pad1[<span class="hl-num">7</span>];
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> __pad2;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> __flags;
+};</code></pre>
+<p>내부 — futex 기반. mutex 보다 복잡한 알고리즘.</p>
+<h3 id="writer-starvation-의-문제">writer starvation 의 문제</h3>
+<pre class="code-block lang-text"><code>[writer starvation]
+
+  문제:
+    reader 가 계속 옴 → rwlock 이 계속 read_locked 상태
+    waiting writer 가 영원히 기다림
+    
+  대응:
+    fairness 정책:
+      - reader preference: 단순, 그러나 writer starvation 위험
+      - writer preference: writer 우선, 그러나 reader 도 starve 가능
+      - fair / FIFO: 도착 순서 (가장 안전, 약간 느림)
+    
+  POSIX 표준:
+    어느 정책 사용할지 unspecified
+    Linux glibc: 기본 writer preference (PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+    또는 pthread_rwlockattr_setkind_np 로 변경</code></pre>
+<h3 id="rwlock-의-성능">rwlock 의 성능</h3>
+<p>read 비율이 매우 높을 때만 — mutex 보다 빠름.</p>
+<pre class="code-block lang-text"><code>[rwlock vs mutex 의 성능]
+
+  100% read:
+    rwlock 압도적 (mutex 의 N 배)
+    
+  90% read, 10% write:
+    rwlock 약간 우수
+    
+  50/50:
+    mutex 가 더 빠를 수 있음
+    (rwlock 의 오버헤드)
+    
+  10% read, 90% write:
+    mutex 가 우수
+    rwlock 의 readers 카운팅 비용
+    
+  → 정확한 비율 측정 필요
+  → 추정으로 rwlock 쓰지 말 것</code></pre>
+<h3 id="pthread_rwlock_tryrdlock-trywrlock"><code class="inline-code">pthread_rwlock_tryrdlock</code> / <code class="inline-code">trywrlock</code></h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_tryrdlock</span>(pthread_rwlock_t *rwlock);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_rwlock_trywrlock</span>(pthread_rwlock_t *rwlock);</code></pre>
+<pre class="code-block lang-text"><code>[try 의 정확한 의미]
+
+  tryrdlock:
+    write lock 진행 중 또는 대기 중인 writer 있으면 EBUSY
+    아니면 read lock 획득
+    
+  trywrlock:
+    free 상태가 아니면 EBUSY
+    아니면 write lock 획득</code></pre>
+<h3 id="spinlock-busy-wait-의-lock">spinlock — busy wait 의 lock</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_spin_init</span>(pthread_spinlock_t *lock, <span class="hl-kw">int</span> pshared);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_spin_lock</span>(pthread_spinlock_t *lock);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_spin_trylock</span>(pthread_spinlock_t *lock);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_spin_unlock</span>(pthread_spinlock_t *lock);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_spin_destroy</span>(pthread_spinlock_t *lock);</code></pre>
+<p>매우 짧은 critical section 에 — mutex 보다 빠를 수 있는 lock.</p>
+<h3 id="spinlock-의-동작">spinlock 의 동작</h3>
+<pre class="code-block lang-text"><code>[spinlock 의 본질]
+
+  mutex:
+    contended 시 — sleep (futex_wait, syscall)
+    수 μs 의 latency
+    
+  spinlock:
+    contended 시 — busy wait (CPU 계속 쓰면서 재시도)
+    sleep 안 함, syscall 없음
+    ~ns 의 latency
+    
+  trade-off:
+    매우 짧은 lock: spinlock 이득
+    조금이라도 길면: CPU 낭비, mutex 가 나음</code></pre>
+<p>내부 — 단순한 atomic CAS loop.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 단순화된 구현]</span>
+<span class="hl-kw">void</span> <span class="hl-fn">spin_lock</span>(spinlock_t *lock) {
+    <span class="hl-kw">while</span> (<span class="hl-fn">atomic_exchange</span>(&amp;lock-&gt;val, <span class="hl-num">1</span>))    <span class="hl-co">/* 1 이면 다시 시도 */</span>
+        <span class="hl-fn">cpu_relax</span>();                          <span class="hl-co">/* pause instruction */</span>
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">spin_unlock</span>(spinlock_t *lock) {
+    <span class="hl-fn">atomic_store</span>(&amp;lock-&gt;val, <span class="hl-num">0</span>);
+}</code></pre>
+<p><code class="inline-code">cpu_relax()</code> 가 x86 의 <code class="inline-code">pause</code> instruction — hyper-threading 협조, power saving.</p>
+<h3 id="spinlock-의-적절한-사용-케이스">spinlock 의 적절한 사용 케이스</h3>
+<pre class="code-block lang-text"><code>[spinlock 의 적절한 use case]
+
+  ✓ critical section 이 _매우_ 짧음 (수 ns ~ 수십 ns)
+  ✓ 다중 코어에서 사용 (단일 코어는 spinlock 의미 없음)
+  ✓ kernel 모드 (sleep 불가능 한 컨텍스트)
+  ✓ scheduler 못 부르는 환경
+  
+  ✗ critical section 길면:
+     다른 thread 의 CPU 시간 낭비
+     성능 매우 안 좋음
+     
+  ✗ 우선순위 다른 thread:
+     priority inversion 위험
+     spin 하는 thread 가 lock holder 를 preempt 못 함</code></pre>
+<h3 id="spinlock-의-함정">spinlock 의 함정</h3>
+<pre class="code-block lang-text"><code>[spinlock 함정]
+
+  ✗ 단일 코어에서:
+     spin 하는 thread 가 CPU 독점
+     lock holder 가 영원히 실행 못 함
+     → deadlock 같은 효과
+     
+  ✗ critical section 이 sleep 부르는 동작:
+     malloc, syscall, I/O 등
+     → 다른 thread 의 busy wait 시간 매우 김
+     → 절대 금지
+     
+  ✗ recursive lock 시도:
+     spinlock 은 보통 non-recursive
+     → 자기 자신의 lock 기다림 → deadlock
+     
+  ✗ scheduler 가 lock holder 를 다른 코어로 옮김:
+     spin 하는 thread 가 다른 코어의 lock 기다림
+     → 캐시 미스, cache coherence 트래픽</code></pre>
+<h3 id="pthread_spinlock_t-의-구조"><code class="inline-code">pthread_spinlock_t</code> 의 구조</h3>
+<pre class="code-block lang-c"><code><span class="hl-kw">typedef</span> <span class="hl-kw">volatile</span> <span class="hl-kw">int</span> pthread_spinlock_t;</code></pre>
+<p>매우 단순 — int 하나. user-space 의 atomic 만 사용. futex 안 씀.</p>
+<h3 id="glibc-의-spinlock-구현">glibc 의 spinlock 구현</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/pthread_spin_lock.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">pthread_spin_lock</span>(pthread_spinlock_t *lock)
+{
+    <span class="hl-co">/* atomic 으로 시도 */</span>
+    <span class="hl-kw">if</span> (<span class="hl-fn">LIBC_PROBE</span>(...), <span class="hl-fn">atomic_exchange_acquire</span>(lock, <span class="hl-num">1</span>) == <span class="hl-num">0</span>)
+        <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+    
+    <span class="hl-co">/* spin */</span>
+    <span class="hl-kw">do</span> {
+        <span class="hl-kw">do</span> {
+            <span class="hl-fn">atomic_spin_nop</span>();    <span class="hl-co">/* cpu_relax */</span>
+        } <span class="hl-kw">while</span> (<span class="hl-fn">atomic_load_relaxed</span>(lock) != <span class="hl-num">0</span>);
+    } <span class="hl-kw">while</span> (<span class="hl-fn">atomic_exchange_acquire</span>(lock, <span class="hl-num">1</span>) != <span class="hl-num">0</span>);
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>영리한 점 — <strong>load 와 exchange 의 분리</strong>. exchange 는 cache line 의 write — cache coherence 트래픽 매우 많음. load 는 share — 트래픽 적음. <strong>load 로 먼저 확인, 0 보이면 exchange</strong> — TTAS (Test-Test-And-Set) 패턴.</p>
+<h3 id="pthread_barrier-n-개-thread-의-만남"><code class="inline-code">pthread_barrier</code> — N 개 thread 의 만남</h3>
+<p>barrier 는 — <strong>N 개 thread 가 모두 도달할 때까지 대기</strong>.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_barrier_init</span>(pthread_barrier_t *barrier,
+                          <span class="hl-kw">const</span> pthread_barrierattr_t *attr,
+                          <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> count);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_barrier_destroy</span>(pthread_barrier_t *barrier);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_barrier_wait</span>(pthread_barrier_t *barrier);</code></pre>
+<h3 id="barrier-의-사용">barrier 의 사용</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+pthread_barrier_t barrier;
+<span class="hl-fn">pthread_barrier_init</span>(&amp;barrier, <span class="hl-kw">NULL</span>, <span class="hl-num">4</span>);   <span class="hl-co">/* 4 thread 필요 */</span>
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-co">/* phase 1 */</span>
+    <span class="hl-fn">process_phase1</span>();
+    
+    <span class="hl-co">/* 모든 thread 가 phase 1 끝날 때까지 대기 */</span>
+    <span class="hl-fn">pthread_barrier_wait</span>(&amp;barrier);
+    
+    <span class="hl-co">/* phase 2 — 모두 동시 시작 */</span>
+    <span class="hl-fn">process_phase2</span>();
+    
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}</code></pre>
+<pre class="code-block lang-text"><code>[barrier 의 의미]
+
+  count 명이 도달하면 — _모두 동시에_ 진행
+  
+  파이프라인 처리:
+    각 단계가 모두 끝나야 다음으로
+    예: 시뮬레이션의 timestep, MPI 의 barrier
+    
+  병렬 알고리즘:
+    각 thread 가 부분 작업 → barrier → 결과 합치기
+    
+  CPU 의 메모리 동기:
+    barrier 가 memory barrier 도 (모든 thread 의 메모리 동기화)</code></pre>
+<h3 id="pthread_barrier_wait-의-반환값"><code class="inline-code">pthread_barrier_wait</code> 의 반환값</h3>
+<pre class="code-block lang-c"><code><span class="hl-kw">int</span> ret = <span class="hl-fn">pthread_barrier_wait</span>(&amp;barrier);
+
+<span class="hl-kw">if</span> (ret == PTHREAD_BARRIER_SERIAL_THREAD) {
+    <span class="hl-co">/* 이 thread 가 _마지막_ 도달자 */</span>
+    <span class="hl-co">/* 한 명만 실행할 코드 (예: 통계 출력) */</span>
+} <span class="hl-kw">else</span> <span class="hl-kw">if</span> (ret == <span class="hl-num">0</span>) {
+    <span class="hl-co">/* 그 외 thread */</span>
+}</code></pre>
+<p>영리한 디자인 — <strong>한 thread 만 특별</strong> 표시. cleanup, 결과 합산 등에 유용.</p>
+<h3 id="barrier-의-reuse">barrier 의 reuse</h3>
+<pre class="code-block lang-text"><code>[barrier 의 재사용]
+
+  pthread_barrier_init(&amp;b, NULL, 4);
+  /* round 1 */
+  pthread_barrier_wait(&amp;b);
+  
+  /* round 2 — 다시 사용 가능! */
+  pthread_barrier_wait(&amp;b);
+  
+  → 매번 init 안 해도 됨
+  → 내부적으로 generation count 사용</code></pre>
+<h3 id="barrier-의-함정">barrier 의 함정</h3>
+<pre class="code-block lang-text"><code>[barrier 함정]
+
+  ✗ count 보다 적은 thread 가 wait
+     → 영원히 대기 (deadlock)
+     
+  ✗ count 보다 많은 thread:
+     첫 count 명이 풀려나고, 그 다음 부터 다시 시작
+     의도하지 않은 동작
+     
+  ✗ wait 중 thread 죽음:
+     barrier 가 영원히 막힘
+     robust 한 barrier 는 POSIX 에 없음</code></pre>
+<h3 id="pthread_once-한-번만-실행"><code class="inline-code">pthread_once</code> — 한 번만 실행</h3>
+<p>특수한 동기화 — <strong>여러 thread 가 호출해도 한 번만 실행</strong>.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+pthread_once_t once_control = PTHREAD_ONCE_INIT;
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_once</span>(pthread_once_t *once_control, <span class="hl-kw">void</span> (*init_routine)(<span class="hl-kw">void</span>));</code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, singleton]</span>
+<span class="hl-kw">static</span> pthread_once_t init_once = PTHREAD_ONCE_INIT;
+<span class="hl-kw">static</span> <span class="hl-kw">int</span> *singleton;
+
+<span class="hl-kw">void</span> <span class="hl-fn">init_singleton</span>(<span class="hl-kw">void</span>) {
+    singleton = <span class="hl-fn">malloc</span>(<span class="hl-kw">sizeof</span>(<span class="hl-kw">int</span>) * <span class="hl-num">100</span>);
+    <span class="hl-co">/* 한 번만 초기화 */</span>
+}
+
+<span class="hl-kw">int</span> *<span class="hl-fn">get_singleton</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">pthread_once</span>(&amp;init_once, init_singleton);
+    <span class="hl-kw">return</span> singleton;
+}
+
+<span class="hl-co">/* 여러 thread 가 get_singleton() 호출해도 init_singleton 은 한 번만 실행 */</span></code></pre>
+<pre class="code-block lang-text"><code>[pthread_once 의 동작]
+
+  내부:
+    once_control 의 상태 (uninit / running / done)
+    futex 기반 동기화
+    
+  보장:
+    init_routine 가 _정확히 한 번_ 실행
+    실행 끝나기 전까지 다른 thread 는 대기
+    실행 후엔 즉시 반환 (oneshot)</code></pre>
+<p>매우 흔한 패턴 — lazy initialization, singleton, library 초기화.</p>
+<h3 id="pthread_key_t-tls-의-일부-preview"><code class="inline-code">pthread_key_t</code> — TLS 의 일부 (preview)</h3>
+<p>49 장에서 자세히. 간단히:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+pthread_key_t key;
+<span class="hl-fn">pthread_key_create</span>(&amp;key, destructor);
+
+<span class="hl-fn">pthread_setspecific</span>(key, ptr);
+<span class="hl-kw">void</span> *p = <span class="hl-fn">pthread_getspecific</span>(key);</code></pre>
+<p>각 thread 가 자기만의 값 — TLS 의 동적 변종.</p>
+<h3 id="sem_t-posix-semaphore-preview"><code class="inline-code">sem_t</code> — POSIX semaphore (preview)</h3>
+<p>48 장에서 자세히. cond variable 의 단순한 대안.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+sem_t sem;
+<span class="hl-fn">sem_init</span>(&amp;sem, <span class="hl-num">0</span>, <span class="hl-num">5</span>);    <span class="hl-co">/* 초기값 5 */</span>
+<span class="hl-fn">sem_wait</span>(&amp;sem);          <span class="hl-co">/* decrement, 0 이면 block */</span>
+<span class="hl-fn">sem_post</span>(&amp;sem);          <span class="hl-co">/* increment, waiter 깨움 */</span></code></pre>
+<h3 id="동기화-primitive-의-비교">동기화 primitive 의 비교</h3>
+<pre class="code-block lang-text"><code>[동기화 primitive 비교]
+
+  ─────────────────────────────────────────────
+  primitive     | 용도               | 비용 (uncontended)
+  ─────────────────────────────────────────────
+  mutex         | 단독 접근            | ~20 ns
+  rwlock        | read 다수 / write 단독 | ~50 ns
+  spinlock      | 매우 짧은 critical  | ~5 ns (단 contention 시 spin)
+  semaphore     | counting, signaling | ~30 ns
+  cond variable | wait / notify       | ~30 ns (wait 시 mutex 비용 추가)
+  barrier       | N 명의 동기 진행     | ~100 ns (N 명 분 wait)
+  pthread_once  | 한 번 초기화         | ~10 ns (init 후 거의 무비용)
+  futex (직접)   | 모든 위의 기반       | ~10 ns
+  ─────────────────────────────────────────────
+  
+  contention 시:
+    모두 비용 매우 증가 (μs ~ ms)
+    spinlock 의 spin 은 CPU 낭비
+    mutex 의 syscall 은 latency</code></pre>
+<h3 id="선택-가이드">선택 가이드</h3>
+<pre class="code-block lang-text"><code>[동기화 primitive 선택 가이드]
+
+  단독 접근 보장:
+    mutex (대부분의 경우)
+    
+  매우 짧은 critical (&lt; 1μs, kernel 안 가도 됨):
+    spinlock — 단 multi-core 에서만
+    
+  read 가 대부분, write 가 가끔:
+    rwlock — 단 측정 후 결정
+    
+  조건 대기:
+    mutex + cond variable (대부분)
+    semaphore — counting 필요할 때
+    eventfd — file descriptor 통합 필요
+    
+  N 개 동기:
+    barrier
+    
+  한 번 초기화:
+    pthread_once (또는 C11 의 once_flag)
+    
+  thread 마다 다른 값:
+    pthread_key + setspecific (49 장)
+    또는 __thread keyword</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>동기화 primitive 들 정리:</p>
+<pre class="code-block lang-text"><code>[rwlock, spinlock, barrier 정리]
+
+  rwlock:
+    ✓ read 여러, write 단독
+    ✓ read-heavy 응용에 유리 (90%+ read)
+    ✓ writer starvation 가능 (정책 선택)
+    ✓ 성능 측정 후 사용 결정
+    
+  spinlock:
+    ✓ kernel 안 가는 lock (busy wait)
+    ✓ 매우 짧은 critical section 전용
+    ✓ multi-core 에서만 의미
+    ✓ critical section 길면 절대 금지
+    ✓ TTAS 패턴 (cache friendly)
+    
+  barrier:
+    ✓ N 명의 동기 진행
+    ✓ 한 thread 가 SERIAL_THREAD 반환 (특별 처리)
+    ✓ reuse 가능 (init 한 번)
+    
+  pthread_once:
+    ✓ 한 번만 실행 보장
+    ✓ lazy init, singleton 에 유용</code></pre>
+<p>다음 장에서는 — POSIX <strong>semaphore</strong> 를 본다. cond variable 의 단순한 대안.</p>
+<h2 class="section-heading" id="48-semaphore-counting-동기화"><span class="section-num">48</span><span class="section-title">semaphore — counting 동기화</span></h2>
+<p>semaphore 가 — Dijkstra (1965) 의 고전적 동기화 primitive. mutex 와 cond variable 보다 _더 단순한 인터페이스_ 로 많은 동기화 패턴을 표현. 단 하나의 unique 한 능력 — <strong>async-signal-safe</strong> (signal handler 에서 호출 가능).</p>
+<h3 id="semaphore-의-본질">semaphore 의 본질</h3>
+<pre class="code-block lang-text"><code>[semaphore 의 본질]
+
+  개념:
+    정수 counter (≥ 0)
+    sem_wait: counter -= 1
+              0 이면 block (양수 될 때까지)
+    sem_post: counter += 1
+              waiter 있으면 깨움
+              
+  비유:
+    헬스장의 신발장 열쇠 (5 개)
+    sem_wait = 열쇠 가져가기 (5 → 4, 없으면 대기)
+    sem_post = 열쇠 반납 (4 → 5)
+    
+  → counting semaphore
+  → binary semaphore (값이 0 또는 1 만) = mutex 비슷</code></pre>
+<h3 id="posix-semaphore-api">POSIX semaphore API</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+#include &lt;semaphore.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">sem_init</span>(sem_t *sem, <span class="hl-kw">int</span> pshared, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> value);
+<span class="hl-kw">int</span> <span class="hl-fn">sem_destroy</span>(sem_t *sem);
+
+<span class="hl-kw">int</span> <span class="hl-fn">sem_wait</span>(sem_t *sem);
+<span class="hl-kw">int</span> <span class="hl-fn">sem_trywait</span>(sem_t *sem);
+<span class="hl-kw">int</span> <span class="hl-fn">sem_timedwait</span>(sem_t *sem, <span class="hl-kw">const</span> <span class="hl-kw">struct</span> timespec *abstime);
+
+<span class="hl-kw">int</span> <span class="hl-fn">sem_post</span>(sem_t *sem);
+
+<span class="hl-kw">int</span> <span class="hl-fn">sem_getvalue</span>(sem_t *sem, <span class="hl-kw">int</span> *sval);</code></pre>
+<pre class="code-block lang-text"><code>[인자]
+
+  sem_init:
+    pshared = 0: thread 간 (process 내)
+    pshared != 0: process 간 (mmap MAP_SHARED 메모리 안)
+    value: 초기 counter 값
+    
+  sem_wait: counter 양수 될 때까지 대기 후 -= 1
+  sem_post: += 1, waiter 깨움
+  sem_trywait: 0 이면 즉시 EAGAIN
+  sem_timedwait: 절대 시간까지 대기
+  sem_getvalue: 현재 counter 값</code></pre>
+<h3 id="unnamed-semaphore-sem_init">unnamed semaphore — <code class="inline-code">sem_init</code></h3>
+<p>thread 간 또는 process 간 (mmap) 사용.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, thread 간]</span>
+sem_t sem;
+<span class="hl-fn">sem_init</span>(&amp;sem, <span class="hl-num">0</span>, <span class="hl-num">1</span>);          <span class="hl-co">/* binary semaphore (value=1) */</span>
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">sem_wait</span>(&amp;sem);            <span class="hl-co">/* token 가져가기 */</span>
+    <span class="hl-co">/* critical section */</span>
+    <span class="hl-fn">sem_post</span>(&amp;sem);            <span class="hl-co">/* token 반납 */</span>
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-fn">sem_destroy</span>(&amp;sem);</code></pre>
+<h3 id="named-semaphore-sem_open">named semaphore — <code class="inline-code">sem_open</code></h3>
+<p>이름으로 관리 — 다른 process 가 같은 이름으로 access.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+#include &lt;fcntl.h&gt;
+sem_t *<span class="hl-fn">sem_open</span>(<span class="hl-kw">const</span> <span class="hl-kw">char</span> *name, <span class="hl-kw">int</span> oflag, <span class="hl-kw">mode_t</span> mode, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> value);
+<span class="hl-kw">int</span> <span class="hl-fn">sem_close</span>(sem_t *sem);
+<span class="hl-kw">int</span> <span class="hl-fn">sem_unlink</span>(<span class="hl-kw">const</span> <span class="hl-kw">char</span> *name);</code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+sem_t *sem = <span class="hl-fn">sem_open</span>(<span class="hl-str">&quot;/myapp_sem&quot;</span>, O_CREAT, <span class="hl-num">0644</span>, <span class="hl-num">1</span>);
+<span class="hl-fn">sem_wait</span>(sem);
+<span class="hl-co">/* ... */</span>
+<span class="hl-fn">sem_post</span>(sem);
+<span class="hl-fn">sem_close</span>(sem);
+
+<span class="hl-co">/* 다른 process: */</span>
+sem_t *sem = <span class="hl-fn">sem_open</span>(<span class="hl-str">&quot;/myapp_sem&quot;</span>, <span class="hl-num">0</span>);    <span class="hl-co">/* 기존 거 open */</span>
+<span class="hl-fn">sem_wait</span>(sem);
+<span class="hl-co">/* ... */</span></code></pre>
+<pre class="code-block lang-text"><code>[named semaphore 의 사용]
+
+  이름:
+    &quot;/&quot; 로 시작 (POSIX 요구)
+    예: &quot;/myapp_sem&quot;
+    
+  파일 시스템:
+    Linux: /dev/shm/sem.myapp_sem 에 표시
+    
+  사용처:
+    여러 process 간 동기화
+    fork 와 무관한 process 들 (다른 명령어)
+    예: cron job 의 중복 실행 방지</code></pre>
+<h3 id="glibc-의-sem_t-구조">glibc 의 sem_t 구조</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/internaltypes.h master 단순화]</span>
+<span class="hl-kw">struct</span> new_sem {
+#<span class="hl-kw">if</span> __HAVE_64B_ATOMICS
+    <span class="hl-co">/* 64-bit 환경: value + nwaiters 를 64 bit 안에 */</span>
+    __atomic_wide_counter data;
+#<span class="hl-kw">else</span>
+    <span class="hl-co">/* 32-bit: 분리 */</span>
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> value;
+    <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> nwaiters;
+#endif
+    <span class="hl-kw">int</span> private;     <span class="hl-co">/* PTHREAD_PROCESS_PRIVATE 또는 SHARED */</span>
+    <span class="hl-kw">int</span> pad;
+};</code></pre>
+<p><code class="inline-code">data</code> 안에 — <strong>value (token 수) 와 nwaiters (대기 thread 수) 가 함께</strong>. atomic update 로 race-free.</p>
+<h3 id="sem_wait-의-fast-path"><code class="inline-code">sem_wait</code> 의 fast path</h3>
+<p>master 의 단순화:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/sem_waitcommon.c master 단순화]</span>
+<span class="hl-kw">static</span> <span class="hl-kw">int</span>
+<span class="hl-fn">__new_sem_wait_fast</span>(<span class="hl-kw">struct</span> new_sem *sem, <span class="hl-kw">int</span> definitive_result)
+{
+    <span class="hl-co">/* atomic load — value 확인 */</span>
+    <span class="hl-kw">uint64_t</span> d = <span class="hl-fn">atomic_load_relaxed</span>(&amp;sem-&gt;data);
+    
+    <span class="hl-kw">do</span> {
+        <span class="hl-kw">if</span> ((d &amp; SEM_VALUE_MASK) == <span class="hl-num">0</span>)
+            <span class="hl-kw">return</span> -<span class="hl-num">1</span>;     <span class="hl-co">/* counter 가 0, slow path 로 */</span>
+    } <span class="hl-kw">while</span> (!<span class="hl-fn">atomic_compare_exchange_weak_acquire</span>(&amp;sem-&gt;data, &amp;d, d - <span class="hl-num">1</span>));
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;     <span class="hl-co">/* 성공 — counter 감소 */</span>
+}</code></pre>
+<p>uncontended (counter &gt; 0) 케이스 — <strong>한 atomic CAS</strong> 만. syscall 없음. mutex 의 fast path 와 같이 빠름 (~20 ns).</p>
+<h3 id="sem_wait-의-slow-path"><code class="inline-code">sem_wait</code> 의 slow path</h3>
+<p>counter 가 0 이면 — futex_wait 으로 sleep.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/sem_waitcommon.c master 단순화]</span>
+<span class="hl-kw">static</span> <span class="hl-kw">int</span>
+<span class="hl-fn">__new_sem_wait_slow</span>(<span class="hl-kw">struct</span> new_sem *sem, ...)
+{
+    <span class="hl-co">/* nwaiters += 1 */</span>
+    <span class="hl-fn">atomic_fetch_add_relaxed</span>(&amp;sem-&gt;data, SEM_NWAITERS_INC);
+    
+    <span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+        <span class="hl-co">/* 다시 시도 */</span>
+        <span class="hl-kw">if</span> (<span class="hl-fn">__new_sem_wait_fast</span>(sem, <span class="hl-num">0</span>) == <span class="hl-num">0</span>)
+            <span class="hl-kw">break</span>;     <span class="hl-co">/* token 획득 */</span>
+        
+        <span class="hl-co">/* futex_wait: data 가 변할 때까지 대기 */</span>
+        <span class="hl-fn">__futex_abstimed_wait</span>(&amp;sem-&gt;data, SEM_NWAITERS_MASK, ...);
+        <span class="hl-co">/* 깨면 다시 시도 */</span>
+    }
+    
+    <span class="hl-co">/* nwaiters -= 1 */</span>
+    <span class="hl-fn">atomic_fetch_sub_relaxed</span>(&amp;sem-&gt;data, SEM_NWAITERS_INC);
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<h3 id="sem_post-의-동작"><code class="inline-code">sem_post</code> 의 동작</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/sem_post.c master 단순화]</span>
+<span class="hl-kw">int</span>
+<span class="hl-fn">__new_sem_post</span>(sem_t *sem)
+{
+    <span class="hl-co">/* atomic add — value += 1 */</span>
+    <span class="hl-kw">uint64_t</span> d = <span class="hl-fn">atomic_fetch_add_release</span>(&amp;sem-&gt;data, <span class="hl-num">1</span>);
+    
+    <span class="hl-kw">if</span> ((d &amp; SEM_NWAITERS_MASK) != <span class="hl-num">0</span>) {
+        <span class="hl-co">/* waiter 있음 — futex_wake */</span>
+        <span class="hl-fn">__futex_wake</span>(&amp;sem-&gt;data, <span class="hl-num">1</span>, sem-&gt;private);
+    }
+    
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>흐름:</p>
+<pre class="code-block lang-text"><code>[sem_post 의 동작]
+
+  1. atomic add — value += 1
+     fetch_add 가 이전 값 반환
+     
+  2. 이전 값에서 nwaiters 부분 검사:
+     0: waiter 없었음, syscall 불필요 ✓ (fast path)
+     0 아님: waiter 있었음, futex_wake 한 명 깨움
+     
+  → uncontended sem_post 도 syscall 없음</code></pre>
+<h3 id="sem_wait-의-async-signal-safe-능력"><code class="inline-code">sem_wait</code> 의 async-signal-safe 능력</h3>
+<p>매우 unique 한 특성 — <strong>signal handler 에서 안전하게 호출 가능</strong>.</p>
+<pre class="code-block lang-text"><code>[async-signal-safe 의 의미]
+
+  signal handler 안에서 호출 가능한 함수는 매우 제한됨:
+    - signal-safe list 만 (man 7 signal-safety)
+    - malloc, printf 등 _대부분_ 불가
+    
+  pthread 의 동기화 primitive 중:
+    pthread_mutex_lock     ✗ (NOT safe)
+    pthread_cond_signal    ✗
+    pthread_cond_broadcast ✗
+    
+    sem_post              ✓ (★ POSIX 명시)
+    
+  → signal handler 에서 main thread 와 동기화 시 sem_post 만 옵션</code></pre>
+<p>이게 — semaphore 의 가장 unique 한 능력. 다른 동기화 primitive 와 차별점.</p>
+<h3 id="signal-handler-와-main-의-동기화-패턴">signal handler 와 main 의 동기화 패턴</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+#include &lt;signal.h&gt;
+#include &lt;semaphore.h&gt;
+
+sem_t sem;
+
+<span class="hl-kw">void</span> <span class="hl-fn">handler</span>(<span class="hl-kw">int</span> sig) {
+    <span class="hl-fn">sem_post</span>(&amp;sem);                <span class="hl-co">/* ★ signal-safe! */</span>
+    <span class="hl-co">/* main thread 가 처리하도록 알림 */</span>
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">sem_init</span>(&amp;sem, <span class="hl-num">0</span>, <span class="hl-num">0</span>);
+    
+    <span class="hl-fn">signal</span>(SIGUSR1, handler);
+    
+    <span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+        <span class="hl-fn">sem_wait</span>(&amp;sem);            <span class="hl-co">/* signal 받을 때까지 대기 */</span>
+        <span class="hl-co">/* signal 처리 */</span>
+        <span class="hl-fn">process_signal</span>();
+    }
+}</code></pre>
+<p>이 패턴 — <strong>self-pipe trick</strong> 의 대안. 더 효율적.</p>
+<h3 id="producer-consumer-with-semaphores">producer-consumer with semaphores</h3>
+<p>cond variable 없이 — semaphore 둘로 producer-consumer 구현.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, semaphore 기반 producer-consumer]</span>
+#define QUEUE_SIZE <span class="hl-num">100</span>
+
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> {
+    <span class="hl-kw">int</span> items[QUEUE_SIZE];
+    <span class="hl-kw">int</span> head, tail;
+    pthread_mutex_t mtx;     <span class="hl-co">/* 데이터 보호 */</span>
+    sem_t empty;              <span class="hl-co">/* 빈 슬롯 수 */</span>
+    sem_t full;               <span class="hl-co">/* 채워진 슬롯 수 */</span>
+} queue_t;
+
+<span class="hl-kw">void</span> <span class="hl-fn">queue_init</span>(queue_t *q) {
+    q-&gt;head = q-&gt;tail = <span class="hl-num">0</span>;
+    <span class="hl-fn">pthread_mutex_init</span>(&amp;q-&gt;mtx, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">sem_init</span>(&amp;q-&gt;empty, <span class="hl-num">0</span>, QUEUE_SIZE);     <span class="hl-co">/* 처음엔 다 빔 */</span>
+    <span class="hl-fn">sem_init</span>(&amp;q-&gt;full, <span class="hl-num">0</span>, <span class="hl-num">0</span>);                <span class="hl-co">/* 처음엔 0 개 */</span>
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">enqueue</span>(queue_t *q, <span class="hl-kw">int</span> item) {
+    <span class="hl-fn">sem_wait</span>(&amp;q-&gt;empty);     <span class="hl-co">/* 빈 슬롯 있을 때까지 대기 */</span>
+    
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;q-&gt;mtx);
+    q-&gt;items[q-&gt;tail] = item;
+    q-&gt;tail = (q-&gt;tail + <span class="hl-num">1</span>) % QUEUE_SIZE;
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;q-&gt;mtx);
+    
+    <span class="hl-fn">sem_post</span>(&amp;q-&gt;full);      <span class="hl-co">/* 채워진 슬롯 += 1 */</span>
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">dequeue</span>(queue_t *q) {
+    <span class="hl-fn">sem_wait</span>(&amp;q-&gt;full);      <span class="hl-co">/* 채워진 슬롯 있을 때까지 대기 */</span>
+    
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;q-&gt;mtx);
+    <span class="hl-kw">int</span> item = q-&gt;items[q-&gt;head];
+    q-&gt;head = (q-&gt;head + <span class="hl-num">1</span>) % QUEUE_SIZE;
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;q-&gt;mtx);
+    
+    <span class="hl-fn">sem_post</span>(&amp;q-&gt;empty);     <span class="hl-co">/* 빈 슬롯 += 1 */</span>
+    <span class="hl-kw">return</span> item;
+}</code></pre>
+<pre class="code-block lang-text"><code>[semaphore 버전의 producer-consumer 장점]
+
+  ✓ cond variable 보다 코드 단순
+  ✓ while loop 의 spurious wakeup 처리 불필요
+  ✓ counting semaphore 가 자연스럽게 슬롯 수 추적
+  
+  단점:
+    mutex 와 semaphore 의 잘못된 ordering 시 deadlock 위험
+    예: 안에서 sem_wait 하면 lock 잡은 채로 대기</code></pre>
+<h3 id="mutex-와-semaphore-의-차이">mutex 와 semaphore 의 차이</h3>
+<pre class="code-block lang-text"><code>[mutex vs semaphore]
+
+  mutex:
+    - 소유 개념 (owner thread)
+    - lock 한 thread 만 unlock
+    - 가장 빠름 (fast path)
+    - 한 번에 한 명
+    
+  binary semaphore (value=1):
+    - 소유 개념 _없음_ (anyone can post)
+    - signal handler 에서 사용 가능
+    - 약간 더 느림
+    - 한 번에 한 명
+    
+  counting semaphore (value&gt;1):
+    - N 명 동시 허용
+    - 자원 pool (예: connection pool)
+    - rate limiting</code></pre>
+<p>binary semaphore 가 — mutex 와 _기능적으로 비슷_ 하지만, <strong>owner 개념이 없어서 다른 thread 가 post 가능</strong>. mutex 와 semaphore 의 핵심 차이.</p>
+<h3 id="connection-pool-예제">connection pool 예제</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, 자원 풀]</span>
+#define MAX_CONNECTIONS <span class="hl-num">10</span>
+
+sem_t pool;
+<span class="hl-fn">sem_init</span>(&amp;pool, <span class="hl-num">0</span>, MAX_CONNECTIONS);     <span class="hl-co">/* 10 개 connection */</span>
+
+connection_t connections[MAX_CONNECTIONS];
+pthread_mutex_t pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+connection_t *<span class="hl-fn">acquire_connection</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">sem_wait</span>(&amp;pool);     <span class="hl-co">/* connection 사용 가능할 때까지 대기 */</span>
+    
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;pool_mtx);
+    <span class="hl-co">/* free connection 찾기 */</span>
+    connection_t *c = <span class="hl-fn">find_free</span>(connections);
+    c-&gt;in_use = <span class="hl-num">1</span>;
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;pool_mtx);
+    
+    <span class="hl-kw">return</span> c;
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">release_connection</span>(connection_t *c) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;pool_mtx);
+    c-&gt;in_use = <span class="hl-num">0</span>;
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;pool_mtx);
+    
+    <span class="hl-fn">sem_post</span>(&amp;pool);     <span class="hl-co">/* 자원 반납 */</span>
+}</code></pre>
+<p>semaphore 가 — connection 수 자연스럽게 추적. 11 번째 thread 는 sem_wait 에서 대기.</p>
+<h3 id="sem_t-의-크기"><code class="inline-code">sem_t</code> 의 크기</h3>
+<p>POSIX 표준상 <code class="inline-code">sem_t</code> 는 opaque. glibc 의 실제 크기:</p>
+<pre class="code-block lang-text"><code>[sem_t 크기]
+
+  Linux x86_64 (glibc):
+    sem_t = 32 bytes
+    
+  내부 struct new_sem 의 크기
+    data: 8 bytes (atomic 64-bit)
+    private: 4 bytes
+    pad: 20 bytes
+    
+  배열 처리:
+    sem_t sems[100];
+    → 3.2 KB</code></pre>
+<h3 id="sysv-semaphore-와의-차이">SysV semaphore 와의 차이</h3>
+<p>Linux 에는 — POSIX 외에 <strong>SysV semaphore</strong> 도 있다 (옛 IPC mechanism).</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - SysV API]</span>
+#include &lt;sys/sem.h&gt;
+<span class="hl-kw">int</span> <span class="hl-fn">semget</span>(key_t key, <span class="hl-kw">int</span> nsems, <span class="hl-kw">int</span> semflg);
+<span class="hl-kw">int</span> <span class="hl-fn">semop</span>(<span class="hl-kw">int</span> semid, <span class="hl-kw">struct</span> sembuf *sops, <span class="hl-kw">size_t</span> nsops);
+<span class="hl-kw">int</span> <span class="hl-fn">semctl</span>(<span class="hl-kw">int</span> semid, <span class="hl-kw">int</span> semnum, <span class="hl-kw">int</span> cmd, ...);</code></pre>
+<pre class="code-block lang-text"><code>[POSIX vs SysV semaphore]
+
+  POSIX semaphore (현대 권장):
+    sem_t, sem_init, sem_wait, sem_post
+    user-space 의 atomic + futex
+    매우 빠름
+    
+  SysV semaphore (옛 UNIX):
+    semget, semop
+    완전히 kernel 안 자료구조
+    syscall 매번 — 느림
+    더 복잡한 의미 (atomic group operation)
+    
+  거의 모든 새 코드는 POSIX 사용</code></pre>
+<h3 id="sem_timedwait-시간-제한"><code class="inline-code">sem_timedwait</code> — 시간 제한</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">struct</span> timespec ts;
+<span class="hl-fn">clock_gettime</span>(CLOCK_REALTIME, &amp;ts);
+ts.tv_sec += <span class="hl-num">5</span>;
+
+<span class="hl-kw">if</span> (<span class="hl-fn">sem_timedwait</span>(&amp;sem, &amp;ts) == -<span class="hl-num">1</span>) {
+    <span class="hl-kw">if</span> (errno == ETIMEDOUT)
+        <span class="hl-co">/* 5 초 timeout */</span>
+    <span class="hl-kw">else</span>
+        <span class="hl-co">/* 다른 에러 */</span>
+}</code></pre>
+<p>POSIX 2024 — <code class="inline-code">sem_clockwait</code> 추가 — clock id 지정 가능 (CLOCK_MONOTONIC 등).</p>
+<h3 id="sem_getvalue-현재-값"><code class="inline-code">sem_getvalue</code> — 현재 값</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+<span class="hl-kw">int</span> <span class="hl-fn">sem_getvalue</span>(sem_t *sem, <span class="hl-kw">int</span> *sval);</code></pre>
+<pre class="code-block lang-text"><code>[sem_getvalue 의 의미]
+
+  현재 counter 값을 반환
+  
+  주의:
+    waiter 있을 때 — 양수 또는 -waiter_count (POSIX 가 unspecified)
+    glibc: 0 또는 양수만 반환 (음수 아님)
+    
+  거의 항상 — 디버깅 용도만
+  실제 동기화 로직에서 사용 X (race)</code></pre>
+<h3 id="semaphore-함정">semaphore 함정</h3>
+<pre class="code-block lang-text"><code>[semaphore 함정]
+
+  ✗ overflow:
+     너무 많은 sem_post → counter overflow (SEM_VALUE_MAX 초과)
+     EOVERFLOW 반환
+     
+  ✗ lost post:
+     sem_destroy 가 waiter 있을 때 — UB
+     
+  ✗ counting 의 잘못된 의미:
+     binary semaphore 인데 multiple post
+     → counter &gt; 1 가능
+     → mutex 처럼 동작 안 함
+     
+  ✗ signal handler 에서 sem_post 외 다른 함수:
+     malloc, printf 등 — 위험
+     sem_post 만 safe
+     
+  ✗ named semaphore 누수:
+     sem_unlink 안 하면 /dev/shm 에 남음
+     reboot 까지 존재</code></pre>
+<h3 id="성능-비교">성능 비교</h3>
+<pre class="code-block lang-text"><code>[성능 비교]
+
+  uncontended:
+    sem_wait/post:    ~25 ns
+    mutex lock/unlock: ~20 ns
+    cond variable:     ~40 ns (mutex 비용 포함)
+    
+  contended:
+    semaphore: 단순 (futex_wait), 빠름
+    mutex: 비슷한 비용
+    cond variable: 약간 더 비쌈 (mutex relock 필요)
+    
+  → semaphore 가 simple case 에 매우 효율적</code></pre>
+<h3 id="어떤-primitive-를-선택">어떤 primitive 를 선택?</h3>
+<pre class="code-block lang-text"><code>[선택 가이드]
+
+  단독 critical section:
+    mutex
+    
+  signal handler 와 동기화:
+    semaphore (signal-safe)
+    
+  자원 pool / counting:
+    semaphore
+    
+  조건 대기 (복잡한 predicate):
+    mutex + cond variable
+    
+  process 간 동기화:
+    pthread_mutex (PROCESS_SHARED)
+    또는 named semaphore
+    
+  rate limiting:
+    semaphore + 별도 thread 로 token 보충</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>semaphore 정리:</p>
+<pre class="code-block lang-text"><code>[semaphore 정리]
+
+  ✓ counter + wait/post 의 단순한 API
+  ✓ POSIX semaphore (현대 권장)
+    - unnamed: sem_init (thread/process 간)
+    - named: sem_open (이름 기반)
+  ✓ glibc 구현: futex 기반, uncontended fast path
+  ✓ data 안에 value + nwaiters atomic
+  ✓ async-signal-safe (sem_post 만)
+    → signal handler 에서 main 과 동기화 가능
+  ✓ mutex 와 차이: owner 개념 없음, signal-safe
+  ✓ counting use case:
+    - connection pool
+    - rate limiting
+    - producer-consumer (cond var 대안)
+  ✓ SysV semaphore: 옛 IPC, 거의 안 씀
+  ✓ 성능: mutex 와 비슷, contention 시 효율</code></pre>
+<p>다음 장에서는 — thread 의 가장 unique 한 자원, <strong>Thread-Local Storage (TLS)</strong> 를 본다. errno 가 thread 마다 다른 비밀.</p>
+<h2 class="section-heading" id="49-tls-thread-local-storage"><span class="section-num">49</span><span class="section-title">TLS — Thread-Local Storage</span></h2>
+<p>40 장에서 — <code class="inline-code">errno</code> 가 글로벌 변수처럼 보이지만 사실 <strong>thread-local</strong> 이라고 했다. 그 메커니즘이 — TLS (Thread-Local Storage). 모든 thread 가 _자기만의 errno_ 를 보는 비밀.</p>
+<h3 id="tls-의-본질">TLS 의 본질</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, __thread keyword]</span>
+<span class="hl-kw">__thread</span> <span class="hl-kw">int</span> counter = <span class="hl-num">0</span>;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    counter++;
+    <span class="hl-co">/* 다른 thread 의 counter 와 _완전히 독립_ */</span>
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;my counter: %d\n&quot;</span>, counter);
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t1, t2;
+    <span class="hl-fn">pthread_create</span>(&amp;t1, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_create</span>(&amp;t2, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t1, <span class="hl-kw">NULL</span>);
+    <span class="hl-fn">pthread_join</span>(t2, <span class="hl-kw">NULL</span>);
+    
+    <span class="hl-co">/* main 의 counter 도 독립 */</span>
+    <span class="hl-fn">printf</span>(<span class="hl-str">&quot;main counter: %d\n&quot;</span>, counter);     <span class="hl-co">/* 0 */</span>
+}</code></pre>
+<p>각 thread 가 — **자기만의 <code class="inline-code">counter</code>** 변수. mutex 없이도 race 없음. 비밀은 — 각 thread 의 메모리에 별도 instance.</p>
+<h3 id="tls-의-두-방식">TLS 의 두 방식</h3>
+<pre class="code-block lang-text"><code>[TLS 의 두 방식]
+
+  1. __thread keyword (정적 TLS)
+     컴파일 시 결정
+     C11 의 _Thread_local 도 같은 의미
+     매우 빠름 (register + offset)
+     
+  2. pthread_key_create (동적 TLS / TSD)
+     실행 시 key 만들고 value 저장
+     약간 느림 (함수 호출)
+     destructor 등록 가능 (자동 cleanup)
+     POSIX 표준</code></pre>
+<h3 id="__thread-의-사용"><code class="inline-code">__thread</code> 의 사용</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">__thread</span> <span class="hl-kw">int</span> local_int = <span class="hl-num">42</span>;
+<span class="hl-kw">__thread</span> <span class="hl-kw">char</span> buffer[<span class="hl-num">1024</span>];
+<span class="hl-kw">__thread</span> <span class="hl-kw">struct</span> mystruct local_struct;
+
+<span class="hl-co">/* C11 표준 */</span>
+<span class="hl-kw">_Thread_local</span> <span class="hl-kw">int</span> counter;
+
+<span class="hl-co">/* C11 매크로 */</span>
+#include &lt;threads.h&gt;
+thread_local <span class="hl-kw">int</span> x;</code></pre>
+<pre class="code-block lang-text"><code>[__thread 의 특성]
+
+  ✓ 매우 빠름 (~1 ns access)
+  ✓ 단순한 syntax
+  ✓ 컴파일러 + linker 가 처리
+  
+  ✗ 정적으로 결정된 변수만
+  ✗ destructor 없음 (수동 정리)
+  ✗ POSIX 표준 아님 (그러나 거의 모든 컴파일러 지원)</code></pre>
+<h3 id="x86_64-의-tls-구현-fs-register">x86_64 의 TLS 구현 — <code class="inline-code">%fs</code> register</h3>
+<p>x86_64 에서 — <code class="inline-code">%fs</code> (segment register) 가 thread 의 메모리 영역 가리킴.</p>
+<pre class="code-block lang-text"><code>[x86_64 TLS layout]
+
+  %fs:0 부터 시작 — struct pthread (TCB)
+  
+  ┌────────────────────────────┐ ← %fs
+  │ tcbhead_t (TCB header)      │
+  │  ├─ tcb (self pointer)       │
+  │  ├─ dtv (DTV pointer)        │
+  │  ├─ self (struct pthread*)   │
+  │  ├─ stack_guard              │
+  │  ├─ pointer_guard            │
+  │  └─ ...                      │
+  ├────────────────────────────┤
+  │ struct pthread 의 나머지     │
+  │  ├─ tid                      │
+  │  ├─ cancelhandling           │
+  │  └─ ...                      │
+  ├────────────────────────────┤ ← %fs:(static_tls_size)
+  │ static TLS (negative offset) │
+  │  __thread 변수들             │
+  └────────────────────────────┘</code></pre>
+<p><code class="inline-code">__thread int x;</code> 접근의 어셈블리:</p>
+<pre class="code-block lang-asm"><code><span class="hl-co">; x86_64 — IE (Initial Exec) 모델</span>
+<span class="hl-kw">movq</span>  <span class="hl-kw">%fs</span>:x@gottpoff(<span class="hl-kw">%rip</span>), <span class="hl-kw">%rax</span>    <span class="hl-co">; x 의 offset 을 GOT 에서</span>
+<span class="hl-kw">addq</span>  <span class="hl-kw">%fs</span>:<span class="hl-num">0</span>, <span class="hl-kw">%rax</span>                    <span class="hl-co">; %fs base + offset = x 의 주소</span>
+<span class="hl-kw">movl</span>  (<span class="hl-kw">%rax</span>), <span class="hl-kw">%eax</span>                   <span class="hl-co">; x 의 값 읽기</span>
+
+<span class="hl-co">; 또는 LE (Local Exec):</span>
+<span class="hl-kw">movl</span>  <span class="hl-kw">%fs</span>:x@tpoff, <span class="hl-kw">%eax</span>              <span class="hl-co">; 한 instruction!</span></code></pre>
+<p>매우 빠름 — register + offset 으로 직접 접근.</p>
+<h3 id="set_thread_area-syscall-tls-설정"><code class="inline-code">set_thread_area</code> syscall — TLS 설정</h3>
+<p>각 thread 의 <code class="inline-code">%fs</code> register 는 — <code class="inline-code">set_thread_area</code>/<code class="inline-code">arch_prctl</code> syscall 로 설정.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [kernel-space - syscall]</span>
+#include &lt;sys/syscall.h&gt;
+#include &lt;<span class="hl-kw">asm</span>/prctl.h&gt;
+
+<span class="hl-co">/* x86_64: */</span>
+<span class="hl-fn">syscall</span>(SYS_arch_prctl, ARCH_SET_FS, fs_base);
+
+<span class="hl-co">/* x86 (32-bit): */</span>
+<span class="hl-fn">syscall</span>(SYS_set_thread_area, &amp;user_desc);</code></pre>
+<p><code class="inline-code">pthread_create</code> 의 <code class="inline-code">CLONE_SETTLS</code> flag 가 — child thread 시작 시 자동으로 이 syscall 호출.</p>
+<h3 id="pthread_key_t-동적-tls"><code class="inline-code">pthread_key_t</code> — 동적 TLS</h3>
+<p>POSIX 의 동적 변종 — 실행 시 key 만들고 value 저장.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX API]</span>
+#include &lt;pthread.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_key_create</span>(pthread_key_t *key, <span class="hl-kw">void</span> (*destructor)(<span class="hl-kw">void</span> *));
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_key_delete</span>(pthread_key_t key);
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_setspecific</span>(pthread_key_t key, <span class="hl-kw">const</span> <span class="hl-kw">void</span> *value);
+<span class="hl-kw">void</span> *<span class="hl-fn">pthread_getspecific</span>(pthread_key_t key);</code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">static</span> pthread_key_t key;
+<span class="hl-kw">static</span> pthread_once_t key_once = PTHREAD_ONCE_INIT;
+
+<span class="hl-kw">void</span> <span class="hl-fn">cleanup</span>(<span class="hl-kw">void</span> *value) {
+    <span class="hl-fn">free</span>(value);     <span class="hl-co">/* thread 종료 시 자동 호출 */</span>
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">init_key</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">pthread_key_create</span>(&amp;key, cleanup);
+}
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_once</span>(&amp;key_once, init_key);
+    
+    <span class="hl-co">/* thread 별 buffer 할당 */</span>
+    <span class="hl-kw">char</span> *buf = <span class="hl-fn">malloc</span>(<span class="hl-num">1024</span>);
+    <span class="hl-fn">pthread_setspecific</span>(key, buf);
+    
+    <span class="hl-co">/* 사용 */</span>
+    buf = <span class="hl-fn">pthread_getspecific</span>(key);
+    <span class="hl-fn">strcpy</span>(buf, <span class="hl-str">&quot;hello&quot;</span>);
+    
+    <span class="hl-co">/* thread 종료 시 cleanup 자동 호출 → free(buf) */</span>
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}</code></pre>
+<h3 id="pthread_key-의-destructor-자동-정리"><code class="inline-code">pthread_key</code> 의 destructor — 자동 정리</h3>
+<p>매우 unique 한 기능 — thread 종료 시 <strong>자동 cleanup</strong>.</p>
+<pre class="code-block lang-text"><code>[pthread_key destructor]
+
+  pthread_key_create(&amp;key, destructor):
+    각 thread 마다 key 의 value 가 있을 수 있음
+    
+  thread 종료 시:
+    각 key 의 destructor 가 그 thread 의 value 로 호출됨
+    NULL 이면 호출 안 함
+    
+  사용처:
+    thread 별 buffer, connection 등 자동 해제
+    
+  주의:
+    destructor 안에서 또 다른 setspecific 가능
+    → 반복 (최대 PTHREAD_DESTRUCTOR_ITERATIONS = 4 회)</code></pre>
+<h3 id="__thread-vs-pthread_key-비교"><code class="inline-code">__thread</code> vs <code class="inline-code">pthread_key</code> 비교</h3>
+<pre class="code-block lang-text"><code>[__thread vs pthread_key]
+
+  __thread:
+    + 매우 빠름 (~1 ns)
+    + 단순한 syntax
+    + 컴파일 시 결정
+    - destructor 없음 (수동 정리)
+    - 정적 변수만
+    
+  pthread_key:
+    + destructor 자동 cleanup
+    + 동적 (runtime 결정)
+    + POSIX 표준
+    - 약간 느림 (~10-30 ns, 함수 호출)
+    - 키 수 제한 (보통 1024)
+    - setspecific/getspecific 호출 필요</code></pre>
+<p>대부분은 — **<code class="inline-code">__thread</code> 우선**. cleanup 필요한 자원이면 — <code class="inline-code">pthread_key</code>.</p>
+<h3 id="errno-의-비밀">errno 의 비밀</h3>
+<p>40 장에서 본 errno 의 구현:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc bits/errno.h]</span>
+<span class="hl-kw">extern</span> <span class="hl-kw">int</span> *<span class="hl-fn">__errno_location</span>(<span class="hl-kw">void</span>);
+#define <span class="hl-fn">errno</span> (*<span class="hl-fn">__errno_location</span>())</code></pre>
+<p><code class="inline-code">__errno_location</code> 의 구현:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc 단순화]</span>
+<span class="hl-kw">int</span> *<span class="hl-fn">__errno_location</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">return</span> &amp;THREAD_SELF-&gt;errno_loc;
+}
+<span class="hl-co">/* THREAD_SELF 는 %fs 의 첫 부분 (struct pthread) */</span></code></pre>
+<p>또는 더 단순히 — <code class="inline-code">__thread int errno;</code> 의 alias.</p>
+<h3 id="__tls_get_addr-동적-라이브러리의-tls"><code class="inline-code">__tls_get_addr</code> — 동적 라이브러리의 TLS</h3>
+<p>dlopen 으로 로드된 라이브러리의 <code class="inline-code">__thread</code> 변수 — 다른 경로 접근.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc 단순화]</span>
+<span class="hl-kw">typedef</span> <span class="hl-kw">struct</span> dl_tls_index {
+    <span class="hl-kw">uint64_t</span> ti_module;     <span class="hl-co">/* 어느 모듈 */</span>
+    <span class="hl-kw">uint64_t</span> ti_offset;     <span class="hl-co">/* 모듈 내 offset */</span>
+} tls_index;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">__tls_get_addr</span>(tls_index *ti) {
+    dtv_t *dtv = <span class="hl-fn">THREAD_DTV</span>();
+    <span class="hl-kw">void</span> *p = dtv[ti-&gt;ti_module].pointer.val;
+    <span class="hl-kw">return</span> (<span class="hl-kw">char</span> *)p + ti-&gt;ti_offset;
+}</code></pre>
+<pre class="code-block lang-text"><code>[__tls_get_addr 의 역할]
+
+  dlopen 으로 로드된 .so 의 __thread 변수 접근:
+    컴파일 시 모듈 ID 와 offset 모름 (런타임 결정)
+    → __tls_get_addr 호출
+    → DTV (Dynamic Thread Vector) 조회
+    → 실제 주소 반환
+    
+  성능:
+    initial-exec 모델: 빠름 (직접 fs:offset)
+    general-dynamic 모델: __tls_get_addr 호출 (~10 ns)</code></pre>
+<h3 id="dtv-dynamic-thread-vector">DTV — Dynamic Thread Vector</h3>
+<p>각 thread 가 — 모든 모듈의 TLS 영역 주소를 가지는 배열.</p>
+<pre class="code-block lang-text"><code>[DTV 의 구조]
+
+  dtv[0] = generation count (변경 시 +1)
+  dtv[1] = main executable 의 TLS
+  dtv[2] = .so #1 의 TLS
+  dtv[3] = .so #2 의 TLS
+  ...
+  
+  dlopen 시:
+    DTV 의 크기 늘림
+    새 모듈의 TLS 영역 할당
+    DTV[N] 에 등록
+    
+  dlclose 시:
+    그 entry NULL 로
+    메모리 해제</code></pre>
+<h3 id="tls-access-model-4-가지">TLS access model 4 가지</h3>
+<p>x86_64 의 컴파일러가 — TLS 접근에 4 가지 model 중 하나 선택.</p>
+<pre class="code-block lang-text"><code>[TLS access model 4 가지]
+
+  1. Local Exec (LE) — 가장 빠름
+     사용처: 메인 실행 파일의 __thread 변수
+     코드: movl %fs:x@tpoff, %eax  (한 instruction)
+     컴파일 옵션: -ftls-model=local-exec
+     
+  2. Initial Exec (IE) — 빠름
+     사용처: 시작 시 로드된 .so 의 __thread 변수
+     코드: movq x@gottpoff(%rip), %rax
+           movl %fs:(%rax), %eax  (2 instructions)
+     컴파일 옵션: -ftls-model=initial-exec
+     
+  3. Local Dynamic (LD) — 보통
+     사용처: 같은 .so 안의 여러 __thread 변수 (한 번 lookup 으로 묶기)
+     코드: __tls_get_addr 한 번 호출 + 여러 offset 사용
+     컴파일 옵션: -ftls-model=local-dynamic
+     
+  4. General Dynamic (GD) — 가장 일반적
+     사용처: dlopen 으로 로드 가능한 .so
+     코드: __tls_get_addr 호출
+     컴파일 옵션: -ftls-model=global-dynamic</code></pre>
+<p>기본은 — <strong>General Dynamic</strong> (가장 호환성 좋음). 성능 critical 한 곳은 — initial-exec 또는 local-exec 명시.</p>
+<h3 id="코드-예-le-vs-gd">코드 예 — LE vs GD</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">__thread</span> <span class="hl-kw">int</span> x;        <span class="hl-co">// 메인 실행 파일</span>
+
+<span class="hl-kw">int</span> <span class="hl-fn">get_x</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">return</span> x;
+}</code></pre>
+<pre class="code-block lang-asm"><code><span class="hl-co">; Local Exec (메인 실행 파일 빌드 시):</span>
+<span class="hl-fn">get_x</span>:
+    <span class="hl-kw">movl</span> <span class="hl-kw">%fs</span>:x@tpoff, <span class="hl-kw">%eax</span>    <span class="hl-co">; 매우 빠름!</span>
+    <span class="hl-kw">ret</span>
+
+<span class="hl-co">; General Dynamic (-fPIC, .so 빌드 시 기본):</span>
+<span class="hl-fn">get_x</span>:
+    <span class="hl-kw">leaq</span> x@tlsgd(<span class="hl-kw">%rip</span>), <span class="hl-kw">%rdi</span>
+    <span class="hl-kw">call</span> __tls_get_addr@PLT   <span class="hl-co">; 함수 호출!</span>
+    <span class="hl-kw">movl</span> (<span class="hl-kw">%rax</span>), <span class="hl-kw">%eax</span>
+    <span class="hl-kw">ret</span></code></pre>
+<p>같은 코드 — 컴파일 옵션 따라 매우 다른 성능.</p>
+<h3 id="tls-메모리-layout">TLS 메모리 layout</h3>
+<pre class="code-block lang-text"><code>[thread 의 TLS 메모리 layout — x86_64]
+
+  높은 주소
+  ┌────────────────────────────────┐
+  │ thread stack (8 MB)              │
+  │                                  │
+  ├────────────────────────────────┤
+  │ struct pthread (TCB)             │ ← %fs:0 (의 한 부분)
+  │   tcbhead_t (header)             │
+  │   tid                            │
+  │   cancelhandling                 │
+  │   ...                            │
+  │   errno_loc                      │
+  ├────────────────────────────────┤
+  │ static TLS (negative offset)     │ ← __thread 변수들
+  │   __thread int counter           │   %fs:counter@tpoff
+  │   __thread char buffer[]         │   (TPOFF 는 음수)
+  ├────────────────────────────────┤
+  │ guard page (PROT_NONE)           │
+  ├────────────────────────────────┤
+  │ (다음 thread 의 stack)            │
+  
+  낮은 주소
+  
+  DTV (별도 영역, malloc):
+    dtv[0] = generation
+    dtv[1] = pointer to main exe TLS
+    dtv[2] = pointer to .so TLS
+    ...</code></pre>
+<h3 id="tls-사용-가이드">TLS 사용 가이드</h3>
+<pre class="code-block lang-text"><code>[언제 TLS 사용]
+
+  ✓ 변수가 매 thread 마다 독립적 (mutex 보다 자연스러움)
+  ✓ thread 별 buffer, cache, scratch space
+  ✓ thread 별 counter, statistic
+  ✓ thread 별 context (예: graphics, DB connection)
+  
+  ✗ thread 간 _공유_ 가 필요한 데이터 — TLS 부적합
+  ✗ 큰 데이터 — 모든 thread 가 메모리 사용
+  ✗ thread 수 매우 많음 — TLS 비용 증가</code></pre>
+<h3 id="tls-의-함정">TLS 의 함정</h3>
+<pre class="code-block lang-text"><code>[TLS 함정]
+
+  ✗ initializer 의 제약:
+     __thread int x = 42;   // OK
+     __thread int *p = &amp;y;  // .so 의 GD 모델에선 어려움 (relocation)
+     
+  ✗ dlopen 후 dlclose:
+     DTV 의 entry 가 freed memory 가리킬 수 있음
+     glibc 가 이를 처리하나 미묘한 race 가능
+     
+  ✗ thread 안에서 stack 의 TLS 주소 다른 thread 전달:
+     다른 thread 에서 그 주소 무효
+     
+  ✗ signal handler 의 TLS:
+     async-signal-safe 측면에서 위험
+     handler 가 같은 thread 의 TLS 만 안전하게 접근
+     
+  ✗ 매우 많은 thread:
+     TLS 영역 mmap 메모리 누적
+     
+  ✗ pthread_key 의 race:
+     pthread_key_create 와 동시 setspecific
+     → 보통 pthread_once 로 보호</code></pre>
+<h3 id="thread-safe-library-의-일반-패턴">thread-safe library 의 일반 패턴</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, library 의 thread-safe 패턴]</span>
+<span class="hl-kw">__thread</span> <span class="hl-kw">struct</span> my_context ctx = {<span class="hl-num">0</span>};
+
+<span class="hl-kw">void</span> <span class="hl-fn">mylib_init</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">if</span> (!ctx.initialized) {
+        ctx.buffer = <span class="hl-fn">malloc</span>(<span class="hl-num">8192</span>);
+        ctx.fd = -<span class="hl-num">1</span>;
+        ctx.initialized = <span class="hl-num">1</span>;
+    }
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">mylib_cleanup</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">if</span> (ctx.initialized) {
+        <span class="hl-fn">free</span>(ctx.buffer);
+        <span class="hl-kw">if</span> (ctx.fd &gt;= <span class="hl-num">0</span>) <span class="hl-fn">close</span>(ctx.fd);
+        ctx.initialized = <span class="hl-num">0</span>;
+    }
+}
+
+<span class="hl-co">/* 모든 thread 가 자기만의 ctx — race 없음 */</span></code></pre>
+<p>매우 흔한 라이브러리 패턴 — TLS 의 정석적 사용.</p>
+<h3 id="c-의-thread_local">C++ 의 <code class="inline-code">thread_local</code></h3>
+<p>C++ 11 — <code class="inline-code">thread_local</code> keyword 표준.</p>
+<pre class="code-block lang-cpp"><code><span class="hl-co">// [user-space - C++ 예제]</span>
+thread_local <span class="hl-kw">int</span> x = <span class="hl-num">0</span>;
+thread_local <span class="hl-kw">std</span>::<span class="hl-kw">string</span> s = <span class="hl-str">&quot;hello&quot;</span>;    <span class="hl-co">// 생성자/소멸자 자동</span></code></pre>
+<p>C++ 의 큰 장점 — <strong>생성자/소멸자 자동 호출</strong> (thread 시작/종료 시).</p>
+<h3 id="rust-의-thread_local">Rust 의 thread_local</h3>
+<p>Rust 도 비슷한 메커니즘:</p>
+<pre class="code-block lang-rust"><code><span class="hl-co">// [user-space - Rust 예제]</span>
+thread_local! {
+    <span class="hl-kw">static</span> COUNTER: RefCell&lt;<span class="hl-kw">i32</span>&gt; = RefCell::<span class="hl-fn">new</span>(<span class="hl-num">0</span>);
+}
+
+COUNTER.<span class="hl-fn">with</span>(|c| {
+    *c.<span class="hl-fn">borrow_mut</span>() += <span class="hl-num">1</span>;
+});</code></pre>
+<p>내부 — <code class="inline-code">pthread_key_create</code> 또는 <code class="inline-code">__thread</code> 사용 (플랫폼 의존).</p>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>TLS 정리:</p>
+<pre class="code-block lang-text"><code>[TLS 정리]
+
+  ✓ thread 마다 독립된 변수
+  ✓ 두 방식:
+    - __thread keyword (정적, 빠름)
+    - pthread_key_create (동적, destructor 가능)
+  ✓ x86_64: %fs register 가 TCB 가리킴
+  ✓ struct pthread + tcbhead_t = TCB
+  ✓ DTV: 동적 라이브러리의 TLS 주소 표
+  ✓ 4 가지 access model:
+    - LE (Local Exec): 가장 빠름
+    - IE (Initial Exec): 빠름
+    - LD (Local Dynamic): 중간
+    - GD (General Dynamic): 기본, dlopen 호환
+  ✓ errno 가 TLS 의 가장 흔한 예
+  ✓ pthread_key 의 destructor 자동 정리 (thread 종료 시)
+  ✓ 함정: dlopen/dlclose, signal handler, race</code></pre>
+<p>다음 장에서는 — pthread 의 가장 위험한 기능, <strong>cancellation</strong> 의 위험성을 본다. 왜 거의 모든 라이브러리가 cancellation 을 거부하는지의 답.</p>
+<h2 class="section-heading" id="50-cancellation-의-위험성"><span class="section-num">50</span><span class="section-title">cancellation 의 위험성</span></h2>
+<p>pthread 에 — <strong>다른 thread 를 강제 종료</strong>시키는 기능이 있다. <code class="inline-code">pthread_cancel</code>. 매우 위험한 기능 — 거의 모든 production 코드가 사용을 회피. 이 장은 — 왜 위험한지의 깊이.</p>
+<h3 id="pthread_cancel-의-api"><code class="inline-code">pthread_cancel</code> 의 API</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - POSIX]</span>
+#include &lt;pthread.h&gt;
+
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_cancel</span>(pthread_t thread);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_setcancelstate</span>(<span class="hl-kw">int</span> state, <span class="hl-kw">int</span> *oldstate);
+<span class="hl-kw">int</span> <span class="hl-fn">pthread_setcanceltype</span>(<span class="hl-kw">int</span> type, <span class="hl-kw">int</span> *oldtype);
+<span class="hl-kw">void</span> <span class="hl-fn">pthread_testcancel</span>(<span class="hl-kw">void</span>);
+
+<span class="hl-kw">void</span> <span class="hl-fn">pthread_cleanup_push</span>(<span class="hl-kw">void</span> (*routine)(<span class="hl-kw">void</span> *), <span class="hl-kw">void</span> *arg);
+<span class="hl-kw">void</span> <span class="hl-fn">pthread_cleanup_pop</span>(<span class="hl-kw">int</span> execute);</code></pre>
+<p>기본 사용:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+        <span class="hl-fn">do_work</span>();
+    }
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t;
+    <span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    
+    <span class="hl-fn">sleep</span>(<span class="hl-num">5</span>);
+    <span class="hl-fn">pthread_cancel</span>(t);          <span class="hl-co">/* worker 종료 시키기 */</span>
+    
+    <span class="hl-fn">pthread_join</span>(t, <span class="hl-kw">NULL</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<p>겉보기엔 단순. 그러나 — 매우 미묘한 문제들.</p>
+<h3 id="cancellation-의-의미">cancellation 의 의미</h3>
+<pre class="code-block lang-text"><code>[cancellation 의 동작]
+
+  pthread_cancel(t):
+    t 에게 &quot;종료해&quot; 신호 보냄
+    실제 종료 시점은 — t 가 cancellation point 도달할 때
+    
+  cancellation point 의 의미:
+    syscall 또는 라이브러리 함수의 _특정 지점_
+    POSIX 가 명시한 함수들 (예: read, write, sleep, pthread_cond_wait)
+    
+  종료 방식:
+    내부적으로 — 특수한 exception 발생
+    cleanup handlers 실행
+    TSD destructors 실행
+    pthread_exit(PTHREAD_CANCELED) 와 같은 효과</code></pre>
+<h3 id="cancellation-point-의-목록">cancellation point 의 목록</h3>
+<p>POSIX 가 명시한 — <strong>cancellation point</strong> 들.</p>
+<pre class="code-block lang-text"><code>[주요 cancellation points]
+
+  I/O syscalls:
+    read, write, readv, writev
+    open, close, fopen, fclose
+    fread, fwrite, fgets, fputs
+    poll, select, epoll_wait
+    
+  Sleep:
+    sleep, nanosleep
+    pthread_cond_wait, pthread_cond_timedwait
+    sem_wait, sem_timedwait
+    pthread_join
+    
+  System:
+    wait, waitpid
+    fcntl (F_SETLKW)
+    msgsnd, msgrcv
+    
+  Network:
+    accept, connect, recv, send
+    recvfrom, sendto, recvmsg, sendmsg
+    
+  기타:
+    msync, fsync, fdatasync
+    system, popen
+    tcdrain
+    
+  ★ 매우 많음 — 거의 모든 blocking 함수</code></pre>
+<p>이게 — 첫 번째 위험. 어디서 cancel 될지 예측 어렵다.</p>
+<h3 id="cancellation-의-두-type">cancellation 의 두 type</h3>
+<pre class="code-block lang-text"><code>[cancellation type]
+
+  PTHREAD_CANCEL_DEFERRED (기본):
+    cancellation point 에서만 종료
+    예: read 호출 중 → cancel 도착 → read 가 종료점에서 멈춤
+    → 약간 더 안전
+    
+  PTHREAD_CANCEL_ASYNCHRONOUS:
+    ★ 즉시 종료
+    어느 시점이든 (memory access, register update 중)
+    → 매우 위험 (race, 자원 누수)
+    → 거의 안 씀
+    
+  PTHREAD_CANCEL_DISABLE / ENABLE:
+    cancellation 자체를 잠시 끔</code></pre>
+<p>대부분 — <strong>DEFERRED 만 사용 권장</strong>. ASYNCHRONOUS 는 정말 특수한 경우만.</p>
+<h3 id="자원-누수의-함정">자원 누수의 함정</h3>
+<p>가장 큰 위험 — <strong>lock 잡은 채로 cancel</strong>.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 위험 예제]</span>
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+    
+    <span class="hl-co">/* 여기서 cancel 도달 가능! */</span>
+    <span class="hl-co">/* (mutex_lock 자체가 cancellation point) */</span>
+    
+    <span class="hl-co">/* 또는: */</span>
+    <span class="hl-fn">read</span>(fd, buf, n);    <span class="hl-co">/* ← 여기서 cancel */</span>
+    
+    <span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);    <span class="hl-co">/* 실행 안 됨! */</span>
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-co">/* mtx 영원히 잠긴 채로 thread 종료
+   → 다른 thread 영원히 대기 → deadlock */</span></code></pre>
+<pre class="code-block lang-text"><code>[cancellation 의 자원 누수]
+
+  ✗ mutex 잡은 채 종료 → 다른 thread 영원히 대기
+  ✗ malloc 한 메모리 free 안 함 → 누수
+  ✗ open 한 fd 안 닫힘 → 누수
+  ✗ malloc 의 중간 상태 (arena lock) → heap 손상 가능
+  
+  → 모든 cancellation point 마다 _자원 정리_ 필요
+  → 매우 복잡</code></pre>
+<h3 id="pthread_cleanup_push-pop-자동-정리"><code class="inline-code">pthread_cleanup_push</code> / <code class="inline-code">pop</code> — 자동 정리</h3>
+<p>cancellation 시 자동 실행되는 cleanup handler.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">void</span> <span class="hl-fn">cleanup</span>(<span class="hl-kw">void</span> *arg) {
+    pthread_mutex_t *mtx = arg;
+    <span class="hl-fn">pthread_mutex_unlock</span>(mtx);    <span class="hl-co">/* lock 풀어줌 */</span>
+}
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+    
+    <span class="hl-fn">pthread_cleanup_push</span>(cleanup, &amp;mtx);     <span class="hl-co">/* cancel 시 호출됨 */</span>
+    
+    <span class="hl-co">/* critical section — cancel 가능 */</span>
+    <span class="hl-fn">read</span>(fd, buf, n);
+    
+    <span class="hl-fn">pthread_cleanup_pop</span>(<span class="hl-num">1</span>);     <span class="hl-co">/* 1: cleanup 실행, 0: skip */</span>
+    <span class="hl-co">/* pop 의 1 이 unlock 함 */</span>
+    
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}</code></pre>
+<pre class="code-block lang-text"><code>[pthread_cleanup_push/pop 의 동작]
+
+  push: stack 에 cleanup 등록
+  pop: stack 에서 제거
+    인자 0: 등록만 했었음 (cleanup 안 실행)
+    인자 1: cleanup 실행 후 제거
+    
+  cancellation 시:
+    push 한 모든 handler 가 LIFO 순서로 호출
+    그 다음 thread 종료
+    
+  ★ push/pop 은 같은 scope (같은 { }) 내에서만!
+    매크로로 구현되어 있어 (setjmp/longjmp 비슷)
+    if/while 같은 statement 안에서 시작/끝 안 됨</code></pre>
+<h3 id="pthread_cleanup_push-의-매크로-트릭"><code class="inline-code">pthread_cleanup_push</code> 의 매크로 트릭</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc pthread.h master 단순화]</span>
+#define <span class="hl-fn">pthread_cleanup_push</span>(routine, arg) \
+    <span class="hl-kw">do</span> { \
+        __pthread_cleanup_buffer __clb; \
+        <span class="hl-fn">_pthread_cleanup_push</span>(&amp;__clb, (routine), (arg));
+
+#define <span class="hl-fn">pthread_cleanup_pop</span>(execute) \
+        <span class="hl-fn">_pthread_cleanup_pop</span>(&amp;__clb, (execute)); \
+    } <span class="hl-kw">while</span> (<span class="hl-num">0</span>)</code></pre>
+<p>영리한 trick — **<code class="inline-code">do { ... } while(0)</code>** 으로 scope 묶음. 같은 scope 내 push/pop 강제.</p>
+<h3 id="가장-안전한-패턴-disable">가장 안전한 패턴 — disable</h3>
+<p>cancel 받기 싫은 critical section 은 — 잠시 disable.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">int</span> oldstate;
+<span class="hl-fn">pthread_setcancelstate</span>(PTHREAD_CANCEL_DISABLE, &amp;oldstate);
+
+<span class="hl-co">/* critical section — cancel 받지 않음 */</span>
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);
+<span class="hl-fn">do_critical_work</span>();
+<span class="hl-fn">pthread_mutex_unlock</span>(&amp;mtx);
+
+<span class="hl-fn">pthread_setcancelstate</span>(oldstate, <span class="hl-kw">NULL</span>);    <span class="hl-co">/* 원래 상태로 */</span></code></pre>
+<p>이 패턴이 — 가장 안전. 단 critical section 길면 — cancel 의 응답성 떨어짐.</p>
+<h3 id="거의-모든-라이브러리가-cancellation-거부">거의 모든 라이브러리가 cancellation 거부</h3>
+<p>대부분의 C library (특히 glibc 자체) — cancellation safety 보장 안 함.</p>
+<pre class="code-block lang-text"><code>[cancellation 의 현실]
+
+  많은 라이브러리:
+    cancellation safe 가 _아님_
+    → cancel 시 내부 자료구조 깨질 수 있음
+    
+  malloc 의 위험:
+    arena lock 잡은 채로 cancel → 다른 malloc 영원히 대기
+    
+  glibc 의 stdio:
+    FILE 의 lock 잡은 채로 cancel → 다른 thread 의 printf 영원히 block
+    → glibc 의 fopen 에 &quot;c&quot; mode 가 있는 이유 (cancellation point 안 됨)
+    
+  C++ STL:
+    exception safety 와 cancellation 의 호환성 미보장
+    
+  → 결과적으로: cancellation 거의 안 쓰는 게 권장</code></pre>
+<h3 id="권장-대안-flag-check">권장 대안 — flag + check</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 권장 패턴]</span>
+<span class="hl-kw">volatile</span> sig_atomic_t should_exit = <span class="hl-num">0</span>;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">while</span> (!should_exit) {
+        <span class="hl-fn">do_some_work</span>();
+        
+        <span class="hl-co">/* 가끔 검사 */</span>
+        <span class="hl-kw">if</span> (should_exit) <span class="hl-kw">break</span>;
+        
+        <span class="hl-fn">do_more_work</span>();
+    }
+    
+    <span class="hl-co">/* 정상 종료 — 모든 자원 정리 */</span>
+    <span class="hl-fn">cleanup_resources</span>();
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    pthread_t t;
+    <span class="hl-fn">pthread_create</span>(&amp;t, <span class="hl-kw">NULL</span>, worker, <span class="hl-kw">NULL</span>);
+    
+    <span class="hl-fn">sleep</span>(<span class="hl-num">5</span>);
+    should_exit = <span class="hl-num">1</span>;            <span class="hl-co">/* cancel 대신 flag */</span>
+    
+    <span class="hl-fn">pthread_join</span>(t, <span class="hl-kw">NULL</span>);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<pre class="code-block lang-text"><code>[flag 패턴의 장점]
+
+  ✓ 종료 시점 명확 (사용자가 제어)
+  ✓ 자원 정리 보장
+  ✓ atomic 한 사용 (sig_atomic_t)
+  ✓ signal handler 에서도 set 가능
+  ✓ 디버그 쉬움</code></pre>
+<h3 id="blocking-i-o-의-처리">blocking I/O 의 처리</h3>
+<p>flag 패턴의 어려움 — <code class="inline-code">read</code> 같은 blocking syscall 안에서 멈춰있을 때.</p>
+<pre class="code-block lang-text"><code>[blocking I/O 처리 방법]
+
+  방법 1: timeout 사용
+    select/poll/epoll 의 timeout
+    또는 SO_RCVTIMEO socket option
+    
+  방법 2: pipe trick
+    pipe 만들고 fd 도 select 에 추가
+    종료 시 pipe 에 byte 보냄 → select 깨어남
+    
+  방법 3: pthread_kill 로 signal
+    blocking syscall 이 EINTR 로 반환
+    signal handler 가 should_exit 설정
+    
+  방법 4: eventfd
+    pipe 와 비슷하지만 더 가벼움</code></pre>
+<h3 id="eventfd-기반-종료">eventfd 기반 종료</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제]</span>
+<span class="hl-kw">int</span> exit_fd;
+
+<span class="hl-kw">void</span> *<span class="hl-fn">worker</span>(<span class="hl-kw">void</span> *arg) {
+    <span class="hl-kw">struct</span> pollfd pfds[<span class="hl-num">2</span>] = {
+        {.fd = data_fd, .events = POLLIN},
+        {.fd = exit_fd, .events = POLLIN},
+    };
+    
+    <span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+        <span class="hl-fn">poll</span>(pfds, <span class="hl-num">2</span>, -<span class="hl-num">1</span>);
+        
+        <span class="hl-kw">if</span> (pfds[<span class="hl-num">1</span>].revents &amp; POLLIN) {
+            <span class="hl-kw">break</span>;    <span class="hl-co">/* exit signal */</span>
+        }
+        
+        <span class="hl-kw">if</span> (pfds[<span class="hl-num">0</span>].revents &amp; POLLIN) {
+            <span class="hl-fn">handle_data</span>();
+        }
+    }
+    
+    <span class="hl-kw">return</span> <span class="hl-kw">NULL</span>;
+}
+
+<span class="hl-kw">int</span> <span class="hl-fn">main</span>(<span class="hl-kw">void</span>) {
+    exit_fd = <span class="hl-fn">eventfd</span>(<span class="hl-num">0</span>, <span class="hl-num">0</span>);
+    <span class="hl-co">/* ... */</span>
+    
+    <span class="hl-co">/* 종료 시 */</span>
+    <span class="hl-kw">uint64_t</span> one = <span class="hl-num">1</span>;
+    <span class="hl-fn">write</span>(exit_fd, &amp;one, <span class="hl-kw">sizeof</span>(one));
+    <span class="hl-fn">pthread_join</span>(t, <span class="hl-kw">NULL</span>);
+}</code></pre>
+<p>매우 깔끔. cancellation 의 위험 없음.</p>
+<h3 id="go-의-contrast-context-context">Go 의 contrast — context.Context</h3>
+<p>다른 언어가 cancellation 문제 해결한 방법:</p>
+<pre class="code-block lang-go"><code><span class="hl-co">// [Go 예제 — pthread_cancel 의 대안]</span>
+ctx, cancel := context.<span class="hl-fn">WithCancel</span>(context.<span class="hl-fn">Background</span>())
+
+<span class="hl-kw">go</span> <span class="hl-kw">func</span>() {
+    <span class="hl-kw">for</span> {
+        <span class="hl-kw">select</span> {
+        <span class="hl-kw">case</span> &lt;-ctx.<span class="hl-fn">Done</span>():
+            <span class="hl-co">// 정리 후 종료</span>
+            <span class="hl-kw">return</span>
+        <span class="hl-kw">case</span> data := &lt;-dataChan:
+            <span class="hl-fn">process</span>(data)
+        }
+    }
+}()
+
+time.<span class="hl-fn">Sleep</span>(<span class="hl-num">5</span> * time.Second)
+<span class="hl-fn">cancel</span>()    <span class="hl-co">// 종료 신호</span></code></pre>
+<pre class="code-block lang-text"><code>[Go 의 context 모델]
+
+  ✓ 명시적 cancel 지점 (select)
+  ✓ 자원 정리 자연스러움 (defer)
+  ✓ 자식 goroutine 으로 전파 (계층적)
+  ✓ deadline 도 지원
+  
+  → pthread_cancel 의 모든 문제 해결
+  → Go 가 대규모 동시성에 적합한 이유 중 하나</code></pre>
+<p>C 의 pthread 는 — 이런 깔끔한 모델이 없음. 사용자가 직접 만들어야.</p>
+<h3 id="pthread_setcanceltype-의-위험"><code class="inline-code">pthread_setcanceltype</code> 의 위험</h3>
+<p>ASYNCHRONOUS 의 위험:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 매우 위험]</span>
+<span class="hl-fn">pthread_setcanceltype</span>(PTHREAD_CANCEL_ASYNCHRONOUS, <span class="hl-kw">NULL</span>);
+
+<span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+    counter++;        <span class="hl-co">/* 여기서 cancel 가능 */</span>
+    array[i] = x;     <span class="hl-co">/* 여기서 cancel 가능 */</span>
+    <span class="hl-fn">malloc</span>(...);      <span class="hl-co">/* malloc 의 _중간_ 에서 cancel → heap 손상! */</span>
+}</code></pre>
+<pre class="code-block lang-text"><code>[ASYNCHRONOUS 의 함정]
+
+  어디서든 cancel 가능 — instruction level
+  → memory 의 inconsistent 상태에서 종료
+  → malloc 의 arena lock 잡은 채
+  → file descriptor 닫는 중
+  → 등 모든 곳
+  
+  유일한 안전한 코드:
+    pure computation (memory write 없음)
+    부수효과 없는 함수
+    
+  → 거의 모든 실제 코드에서 위험
+  → 사용 거의 안 됨</code></pre>
+<h3 id="glibc-의-cancellation-구현">glibc 의 cancellation 구현</h3>
+<p>내부적으로 — POSIX exception 으로 구현.</p>
+<pre class="code-block lang-text"><code>[glibc 의 cancellation 구현]
+
+  pthread_cancel:
+    target thread 에 signal (SIGCANCEL = 32)
+    
+  signal handler:
+    상태 검사 (PTHREAD_CANCEL_ENABLE 인지)
+    deferred 면 cancellation point 도달까지 미룸
+    asynchronous 면 즉시 longjmp
+    
+  cancellation point:
+    syscall wrapper 안에 _check_ 코드
+    예: read wrapper 가 syscall 전후로 cancel check
+    
+  종료:
+    forced_unwind (GCC 의 unwind library) 사용
+    cleanup handlers 호출 (push/pop 의 stack)
+    C++ destructor 도 호출 (try/catch 처럼)</code></pre>
+<p>매우 정교 — 그러나 사용자 코드의 미묘한 race 가능.</p>
+<h3 id="cancellation-safety-의-분류">cancellation safety 의 분류</h3>
+<p>POSIX 가 — 함수들을 cancellation safety 로 분류:</p>
+<pre class="code-block lang-text"><code>[cancellation safety 분류]
+
+  Async-Cancel-Safe:
+    어떤 cancellation 도 안전
+    매우 적음 (pthread_cancel, pthread_setcancelstate, ...)
+    
+  Cancel-Safe (synchronous):
+    deferred cancel 만 안전
+    예: 대부분의 syscall wrapper
+    
+  Cancel-Unsafe:
+    cancel 시 자원 손상 가능
+    예: malloc, free, printf, ...
+    매우 많음</code></pre>
+<p>대부분의 함수가 — <strong>cancel-unsafe</strong>. 그래서 cancellation 사용 시 매우 조심해야.</p>
+<h3 id="결국-cancellation-안-쓰는-게-답">결국 — cancellation 안 쓰는 게 답</h3>
+<pre class="code-block lang-text"><code>[현실의 선택]
+
+  대부분의 production code:
+    ✓ flag + check 패턴
+    ✓ eventfd / pipe 로 blocking 깨움
+    ✓ signal 로 EINTR 만들기
+    ✗ pthread_cancel 안 씀
+    
+  cancellation 쓰는 경우:
+    매우 특수한 응용
+    예: 디버거의 stop signal
+    예: thread pool 의 시간 제한
+    그것도 매우 조심스럽게 (disable, cleanup_push 가득)</code></pre>
+<h3 id="표-cancellation-vs-대안">표 — cancellation vs 대안</h3>
+<pre class="code-block lang-text"><code>[cancellation vs 대안 비교]
+
+  ─────────────────────────────────────────────────────
+  기준               | pthread_cancel | flag + eventfd
+  ─────────────────────────────────────────────────────
+  종료 지점 명확성    | 모호함          | 명확함 (poll 위치)
+  자원 정리          | cleanup_push 필요| 자연스러움
+  blocking 깨움      | cancellation pt | eventfd
+  디버깅            | 매우 어려움      | 쉬움
+  성능              | 비슷            | 비슷
+  표준              | POSIX          | POSIX
+  실수 가능성        | 매우 높음       | 보통
+  ─────────────────────────────────────────────────────</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>cancellation 정리:</p>
+<pre class="code-block lang-text"><code>[cancellation 정리]
+
+  ✓ pthread_cancel 로 thread 강제 종료
+  ✓ 두 type:
+    - DEFERRED (cancellation point 에서만)
+    - ASYNCHRONOUS (즉시, 매우 위험)
+  ✓ cancellation point 가 _많음_ (모든 blocking 함수)
+  ✓ 자원 누수 위험:
+    - mutex 잡은 채 종료 → deadlock
+    - malloc 한 메모리 누수
+    - fd 누수
+  ✓ pthread_cleanup_push/pop 으로 자동 정리
+    - 매크로 trick (같은 scope 필수)
+  ✓ pthread_setcancelstate(DISABLE) 로 잠시 끄기
+  ✓ 대부분 라이브러리가 cancel-unsafe
+  ✓ 권장 대안:
+    - volatile sig_atomic_t flag + 검사
+    - eventfd / pipe 로 blocking 깨움
+    - signal 로 EINTR
+  ✓ Go 의 context, Rust 의 Drop 이 깔끔한 대안
+  ✓ ★ production 에선 cancellation 거의 안 씀</code></pre>
+<p>다음 장에서는 — glibc 의 thread 구현 전체, <strong>NPTL</strong> 의 디자인을 본다. LinuxThreads 에서 NPTL 으로의 진화, kernel 과의 협조.</p>
+<h2 class="section-heading" id="51-nptl-glibc-의-thread-구현"><span class="section-num">51</span><span class="section-title">NPTL — glibc 의 thread 구현</span></h2>
+<p>지금까지 본 모든 pthread 메커니즘 — <code class="inline-code">pthread_create</code>, mutex, cond variable, TLS 등 — 의 구현 이름은 <strong>NPTL</strong> (Native POSIX Thread Library). 2003 년 Red Hat 이 LinuxThreads 를 대체. 이 장은 — NPTL 의 디자인과 그 진화의 역사.</p>
+<h3 id="linux-의-thread-역사">Linux 의 thread 역사</h3>
+<pre class="code-block lang-text"><code>[Linux thread 구현의 진화]
+
+  1996: LinuxThreads (Xavier Leroy)
+    Linux 2.0 의 첫 thread 구현
+    clone() 기반
+    그러나 POSIX 호환 불완전
+    
+  2003: NPTL (Ulrich Drepper, Ingo Molnar 등)
+    Red Hat 주도
+    kernel 의 새 primitives 활용 (futex, CLONE_SETTLS 등)
+    완전한 POSIX 호환
+    엄청난 성능 향상
+    
+  2003 ~ 현재: glibc 2.4+ 의 기본
+    NGPT (IBM 의 대안) 와 경쟁 후 NPTL 승리</code></pre>
+<h3 id="linuxthreads-의-문제점">LinuxThreads 의 문제점</h3>
+<p>NPTL 등장 전 LinuxThreads 의 한계:</p>
+<pre class="code-block lang-text"><code>[LinuxThreads 의 문제]
+
+  1. manager thread:
+     pthread_create 마다 — 별도 manager thread 가 처리
+     thread 생성 시 manager 와 통신 (pipe)
+     → 매우 느림 (20+ μs)
+     → 단일 thread bottleneck
+     
+  2. getpid 가 다름:
+     각 thread 가 _다른 PID_ 반환
+     POSIX 의 &quot;한 process = 한 PID&quot; 위반
+     /proc 에서 thread 가 별도 process 처럼
+     
+  3. signal 처리:
+     signal 이 _하나의 thread_ 에만 (manager 가 받음)
+     SIGUSR 같은 process-wide signal 의 잘못된 처리
+     
+  4. 자원 한도:
+     8192 thread 제한 (LDT entries)
+     
+  5. ptrace, gdb:
+     debug 시 thread 들이 _다른 process_ 처럼
+     매우 혼란
+     
+  6. TLS 의 제한:
+     LDT 기반 (느림, 한계)</code></pre>
+<p>이 모든 문제가 — NPTL 에서 해결.</p>
+<h3 id="nptl-의-설계-원칙">NPTL 의 설계 원칙</h3>
+<pre class="code-block lang-text"><code>[NPTL 의 설계 결정]
+
+  1. M:N → 1:1 매핑:
+     user thread = kernel task (CLONE_THREAD)
+     LinuxThreads 도 1:1 였으나 — POSIX 의미 부족
+     NPTL: 진정한 POSIX 의 thread 의미
+     
+  2. kernel 협조:
+     kernel 의 새 syscall 과 flag 활용
+     - futex (FUTEX_WAIT, FUTEX_WAKE)
+     - CLONE_SETTLS, CLONE_CHILD_CLEARTID
+     - tgkill, gettid
+     - exit_group (전체 thread group 종료)
+     
+  3. 효율적 동기화:
+     uncontended fast path (atomic CAS, syscall 없음)
+     contended slow path (futex)
+     
+  4. 빠른 TLS:
+     GDT 기반 (LDT 의 한계 없음)
+     %fs register 직접
+     
+  5. manager thread 제거:
+     모든 thread 가 자기 자신 관리
+     bottleneck 없음</code></pre>
+<h3 id="kernel-의-협조-새-primitives">kernel 의 협조 — 새 primitives</h3>
+<p>NPTL 이 도입되며 — kernel 도 변경 필요. 새 syscall 들:</p>
+<pre class="code-block lang-text"><code>[NPTL 을 위한 새 kernel 기능]
+
+  futex (Linux 2.6.0, 2003):
+    효율적 사용자 공간 lock
+    Fast Userspace muTEX
+    uncontended 면 syscall 없음
+    
+  CLONE_SETTLS:
+    clone 의 새 flag
+    child 의 TLS 영역 자동 설정
+    
+  CLONE_CHILD_CLEARTID:
+    child 종료 시 tid 위치 0 으로
+    futex wake 자동
+    → pthread_join 의 효율적 메커니즘
+    
+  CLONE_PARENT_SETTID:
+    parent 에 child tid 자동 전달
+    
+  CLONE_THREAD:
+    같은 thread group (tgid 공유)
+    → 같은 PID
+    
+  tgkill, tkill (2.5.4):
+    특정 thread 에 signal
+    pthread_kill 의 기반
+    
+  gettid:
+    kernel level tid 얻기
+    
+  exit_group:
+    전체 thread group 종료
+    main thread 의 exit() 가 사용
+    
+  set_robust_list:
+    robust mutex 의 cleanup
+    thread 죽으면 자동 EOWNERDEAD</code></pre>
+<p>이 모든 게 — NPTL 을 위해 kernel 측이 함께 추가한 기능.</p>
+<h3 id="nptl-의-thread-구조">NPTL 의 thread 구조</h3>
+<pre class="code-block lang-text"><code>[NPTL 의 thread layout]
+
+  각 thread:
+    ─────────────────
+    main thread (PID = TID = TGID):
+      kernel 이 직접 생성 (execve)
+      stack: kernel 이 줌 (8 MB)
+      
+    pthread_create 된 thread:
+      glibc 가 mmap 으로 stack
+      clone(...flags...) syscall
+      각자 TID, 같은 TGID
+    ─────────────────
+    
+  각 thread 의 자원:
+    공유: mm, files, fs, sighand, signal, sysv_sem
+    독립: stack, TLS, errno, kernel task</code></pre>
+<h3 id="nptl-코드-위치">NPTL 코드 위치</h3>
+<p>glibc 의 NPTL 디렉토리:</p>
+<pre class="code-block lang-text"><code>[glibc 의 NPTL 소스 트리]
+
+  glibc/nptl/
+    pthread_create.c        — thread 생성
+    pthread_join_common.c   — join 의 핵심
+    pthread_mutex_lock.c    — mutex
+    pthread_mutex_unlock.c
+    pthread_cond_wait.c     — cond variable (~2017 새 알고리즘)
+    pthread_cond_signal.c
+    pthread_cond_broadcast.c
+    pthread_rwlock_*.c      — rwlock
+    pthread_barrier_*.c
+    pthread_key_create.c    — TLS key
+    pthread_setspecific.c
+    pthread_getspecific.c
+    pthread_cancel.c        — cancellation
+    semaphore.c             — POSIX semaphore
+    sem_wait.c, sem_post.c
+    
+    allocatestack.c         — stack 할당 + 캐시
+    descr.h                 — struct pthread (TCB)
+    futex-internal.h        — futex wrapper
+    pthread.c               — 초기화
+    
+  glibc/sysdeps/nptl/
+    lowlevellock.h          — lll_lock, lll_futex_wait 등
+    
+  glibc/sysdeps/unix/sysv/linux/
+    futex-internal.h        — futex syscall 정의
+    lowlevellock-futex.h</code></pre>
+<h3 id="__pthread_initialize_minimal-초기화"><code class="inline-code">__pthread_initialize_minimal</code> — 초기화</h3>
+<p>main thread 가 NPTL 사용 시작 시.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/nptl-init.c master 단순화]</span>
+<span class="hl-kw">void</span>
+<span class="hl-fn">__pthread_initialize_minimal_internal</span>(<span class="hl-kw">void</span>)
+{
+    <span class="hl-co">/* main thread 의 struct pthread 초기화 */</span>
+    <span class="hl-kw">static</span> <span class="hl-kw">struct</span> pthread initial_pthread = {.tid = -<span class="hl-num">1</span>};
+    
+    <span class="hl-co">/* TLS 설정 */</span>
+    <span class="hl-fn">INIT_THREAD_TCB</span>(&amp;initial_pthread);
+    
+    <span class="hl-co">/* main thread 의 tid 얻기 */</span>
+    initial_pthread.tid = <span class="hl-fn">INTERNAL_SYSCALL_CALL</span>(set_tid_address,
+                                                  &amp;initial_pthread.tid);
+    
+    <span class="hl-co">/* SIGCANCEL signal handler 등록 */</span>
+    <span class="hl-kw">struct</span> sigaction sa;
+    sa.sa_handler = sigcancel_handler;
+    <span class="hl-fn">sigaction</span>(SIGCANCEL, &amp;sa, <span class="hl-kw">NULL</span>);
+    
+    <span class="hl-co">/* stack limit 확인 */</span>
+    <span class="hl-kw">struct</span> rlimit limit;
+    <span class="hl-fn">getrlimit</span>(RLIMIT_STACK, &amp;limit);
+    __default_pthread_attr.stacksize = limit.rlim_cur;
+}</code></pre>
+<pre class="code-block lang-text"><code>[NPTL 초기화 단계]
+
+  process 시작 시:
+    1. main thread 의 struct pthread 설정
+    2. TLS 의 %fs base 설정 (arch_prctl)
+    3. set_tid_address syscall — main thread 의 tid 저장 위치
+    4. SIGCANCEL handler 등록
+    5. stack limit 확인
+    
+  → 이후 pthread API 사용 가능</code></pre>
+<h3 id="nptl-의-stack-캐싱">NPTL 의 stack 캐싱</h3>
+<p>매우 영리한 최적화 — stack 의 재사용.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - glibc nptl/allocatestack.c master 단순화]</span>
+<span class="hl-kw">static</span> <span class="hl-kw">int</span> stack_cache_actsize;
+<span class="hl-kw">static</span> list_t stack_cache = <span class="hl-fn">LIST_HEAD_INIT</span>(stack_cache);
+<span class="hl-kw">static</span> <span class="hl-kw">size_t</span> stack_cache_maxsize = <span class="hl-num">40</span> * <span class="hl-num">1024</span> * <span class="hl-num">1024</span>;    <span class="hl-co">/* 40 MB */</span>
+
+<span class="hl-kw">static</span> <span class="hl-kw">int</span>
+<span class="hl-fn">allocate_stack</span>(<span class="hl-kw">const</span> <span class="hl-kw">struct</span> pthread_attr *attr, <span class="hl-kw">struct</span> pthread **pdp, ...)
+{
+    <span class="hl-co">/* 1. cache 에서 적절한 크기의 stack 찾기 */</span>
+    pd = <span class="hl-fn">get_cached_stack</span>(&amp;size, &amp;mem);
+    <span class="hl-kw">if</span> (pd != <span class="hl-kw">NULL</span>) {
+        <span class="hl-co">/* cache 히트! mmap 안 함 */</span>
+        <span class="hl-kw">goto</span> got_stack;
+    }
+    
+    <span class="hl-co">/* 2. 없으면 mmap */</span>
+    mem = <span class="hl-fn">mmap</span>(<span class="hl-kw">NULL</span>, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+               -<span class="hl-num">1</span>, <span class="hl-num">0</span>);
+    <span class="hl-co">/* guard page 추가 */</span>
+    <span class="hl-fn">mprotect</span>(mem, guardsize, PROT_NONE);
+    
+    pd = (<span class="hl-kw">struct</span> pthread *)((<span class="hl-kw">char</span> *)mem + size - <span class="hl-kw">sizeof</span>(<span class="hl-kw">struct</span> pthread));
+    
+got_stack:
+    *pdp = pd;
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+<pre class="code-block lang-text"><code>[stack 캐싱의 효과]
+
+  pthread_create 호출:
+    cache 히트 → mmap 없음, 매우 빠름 (~5 μs)
+    cache 미스 → mmap + setup (~20 μs)
+    
+  thread 종료 시:
+    cache 에 저장 (40 MB 한도)
+    → 다음 pthread_create 가 재사용
+    
+  결과:
+    thread pool 패턴이 매우 효율적
+    short-lived thread 들의 반복 생성도 빠름</code></pre>
+<h3 id="nptl-의-mutex-성능-futex-의-마법">NPTL 의 mutex 성능 — futex 의 마법</h3>
+<p>futex 이전과 이후의 비교:</p>
+<pre class="code-block lang-text"><code>[mutex 성능 비교 (uncontended lock)]
+
+  pre-NPTL LinuxThreads:
+    매번 syscall (kernel mutex)
+    ~500 ns
+    
+  NPTL (futex):
+    atomic CAS 만 (kernel 안 감)
+    ~20 ns
+    
+  → 25 배 빠름
+  → 짧은 critical section 의 응용에 결정적</code></pre>
+<h3 id="futex-의-디자인-천재성">futex 의 디자인 천재성</h3>
+<p>futex 의 핵심 idea — <strong>uncontended case 는 kernel 가지 말자</strong>.</p>
+<pre class="code-block lang-text"><code>[전통적 mutex 의 문제]
+
+  mutex_lock:
+    무조건 syscall → kernel mode
+    kernel 의 wait queue 검사
+    경합 없으면 즉시 반환
+    user mode 복귀
+    
+  비용: ~500 ns (syscall 만)
+  
+  contention 99% 의 경우 — 낭비!
+
+[futex 의 해법]
+
+  user-space 에서 atomic 검사:
+    경합 없으면 → 그냥 진행 (syscall 0)
+    경합 있으면 → syscall (kernel 의 wait queue)
+    
+  user-space 의 결정:
+    &quot;이 변수 값이 X 일 때 대기&quot; 라는 의미를 atomic 하게 보장
+    
+  → 99% 의 경우 syscall 없음 → 25x 빠름</code></pre>
+<h3 id="futex-의-atomic-보장">futex 의 atomic 보장</h3>
+<p><code class="inline-code">futex_wait(addr, val)</code> — &quot;addr 의 값이 val 이면 대기&quot;.</p>
+<pre class="code-block lang-text"><code>[futex 의 race-free 메커니즘]
+
+  thread A:                     thread B:
+  ─────────────                  ─────────────
+  CAS mutex (0→1)               
+  실패 (이미 1)                 CAS mutex (1→2)  /* waiter 표시 */
+                                
+                                set mutex = 0  /* unlock */
+                                futex_wake     /* 깨움 — 그러나 A 아직 안 잠*/
+                                
+  futex_wait(mutex, 2)          
+  kernel: mutex 값이 2 인가?    
+  → 아님 (이미 0) → EAGAIN 즉시 반환  /* missed wakeup 없음 */
+  
+  다시 CAS 시도 → 성공</code></pre>
+<p>이 atomic 검사가 — futex 의 race-free 성. user-space + kernel 의 협조의 정수.</p>
+<h3 id="nptl-의-condition-variable-진화">NPTL 의 condition variable 진화</h3>
+<p>46 장에서 본 — glibc 2.25 의 새 cond variable 알고리즘.</p>
+<pre class="code-block lang-text"><code>[cond variable 의 진화]
+
+  옛 (~2.24):
+    옛 알고리즘 (Ulrich Drepper 의 초기 설계)
+    여러 corner case 버그
+    
+  2.25 (2017.2):
+    완전히 새 알고리즘 (Torvald Riegel)
+    2 group (g1, g2) 디자인
+    더 정확, 동시 wait/signal 의 효율
+    BZ#13165 등 옛 버그 해결</code></pre>
+<h3 id="nptl-의-통합-libpthread-so-제거">NPTL 의 통합 — libpthread.so 제거</h3>
+<p>매우 큰 변화 — glibc 2.34 (2021.8) 이후 — <strong>libpthread.so 가 libc.so 에 통합</strong>.</p>
+<pre class="code-block lang-text"><code>[libpthread.so 의 운명]
+
+  옛 (~ glibc 2.33):
+    libc.so.6   — 일반 C 라이브러리
+    libpthread.so.0  — pthread 라이브러리
+    
+    응용 코드:
+      gcc -lpthread 로 링크 필요
+      pthread_* 함수가 libpthread 에서
+      
+  새 (glibc 2.34+, 2021.8):
+    libc.so.6 만 (pthread 통합)
+    
+    libpthread.so.0:
+      비어있는 stub (호환성 위해 존재)
+      옛 binary 도 동작
+      
+    응용 코드:
+      -lpthread 옵션 — 무시됨 (또는 호환)</code></pre>
+<p>이 통합이 — <strong>single threaded 응용도 NPTL 사용 가능</strong>, deadlock 함정 (예: libc 의 pthread 함수 약한 참조) 제거.</p>
+<h3 id="weak-pthread-함수의-함정-옛">&quot;weak&quot; pthread 함수의 함정 (옛)</h3>
+<p>이전엔 — single-thread 응용에서 pthread 호출 시 <strong>no-op stub</strong> 동작.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - 옛 동작]</span>
+<span class="hl-co">/* main 에서 -lpthread 없이 빌드 */</span>
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+<span class="hl-fn">pthread_mutex_lock</span>(&amp;mtx);    <span class="hl-co">/* 호출 — 그러나 no-op! */</span>
+<span class="hl-co">/* mutex 안 잡힘 */</span></code></pre>
+<pre class="code-block lang-text"><code>[옛 weak pthread 의 함정]
+
+  pthread_mutex_lock 의 weak symbol:
+    libpthread 없으면 → no-op (stub)
+    libpthread 있으면 → 실제 구현
+    
+  결과:
+    library 가 mutex 사용 시도 → 사용자가 -lpthread 안 하면 깨짐
+    매우 위험한 silent failure
+    
+  glibc 2.34+ 의 해결:
+    pthread 가 libc 의 일부
+    weak symbol 트릭 없음
+    항상 정상 동작</code></pre>
+<h3 id="nptl-vs-musl-의-thread-구현">NPTL vs musl 의 thread 구현</h3>
+<pre class="code-block lang-text"><code>[NPTL vs musl 의 thread 비교]
+
+  NPTL (glibc):
+    매우 많은 기능 (PI, robust, ROBUST_NP 등)
+    큰 코드 베이스
+    호환성 매우 높음
+    개별 기능 매우 정교
+    
+  musl:
+    핵심 기능만
+    훨씬 작은 코드
+    매우 단순
+    PI mutex 없음
+    옛 함수들 (deprecated) 안 함
+    
+  성능:
+    uncontended: 비슷 (둘 다 futex)
+    contended: NPTL 약간 빠를 수도 (정교한 알고리즘)
+    초기화: musl 매우 빠름 (단순)
+    stack 기본: musl 128 KB vs NPTL 8 MB (★ 큰 차이)</code></pre>
+<h3 id="nptl-의-디버그-libthread_db">NPTL 의 디버그 — <code class="inline-code">libthread_db</code></h3>
+<p>gdb 의 thread debug 를 위한 — <code class="inline-code">libthread_db.so</code>.</p>
+<pre class="code-block lang-text"><code>[libthread_db 의 역할]
+
+  gdb 가 thread 정보 얻기:
+    - 어느 thread 가 어디서 멈췄나
+    - 각 thread 의 stack
+    - mutex 의 waiter
+    
+  libthread_db 가 — glibc 의 내부 자료구조 노출
+    - struct pthread 의 위치
+    - _IO_list_all 같은
+    
+  ★ NPTL 디자인의 일부
+    libpthread 와 같이 빌드, 같은 ABI</code></pre>
+<h3 id="nptl-의-시그널-처리">NPTL 의 시그널 처리</h3>
+<p>POSIX 의 thread 별 signal 의미 구현.</p>
+<pre class="code-block lang-text"><code>[NPTL 의 signal 처리]
+
+  process-wide signal (kill):
+    kernel 이 thread group 의 _아무 thread_ 에 전달
+    blocking 안 한 thread 선호
+    
+  thread-targeted (pthread_kill):
+    내부적으로 tgkill syscall
+    정확히 그 thread 만
+    
+  signal mask:
+    각 thread 가 자기만의 mask
+    pthread_sigmask 로 변경
+    
+  signal handler:
+    thread 들이 _공유_ (CLONE_SIGHAND)
+    실행 컨텍스트는 받은 thread
+    
+  SIGCANCEL (32, 내부):
+    pthread_cancel 가 사용
+    NPTL 의 내부 signal</code></pre>
+<h3 id="nptl-의-future-통합과-단순화">NPTL 의 future — 통합과 단순화</h3>
+<pre class="code-block lang-text"><code>[NPTL 의 향후 방향]
+
+  계속 진행:
+    ✓ libpthread 의 libc 통합 (완료, 2.34)
+    ✓ glibc 의 cond variable 알고리즘 개선 (완료, 2.25)
+    ✓ ROBUST mutex 의 효율 (2019~)
+    ✓ futex 의 새 syscall (FUTEX2 — Linux 5.16~)
+    ✓ rseq (restartable sequences) — lock-free 동기화
+    
+  잠재 변경:
+    PI mutex 의 단순화
+    cancellation 의 더 안전한 API (?)
+    io_uring 과의 통합</code></pre>
+<h3 id="nptl-의-영향">NPTL 의 영향</h3>
+<p>NPTL 의 성공이 — Linux 의 서버 시장 점령에 결정적.</p>
+<pre class="code-block lang-text"><code>[NPTL 의 산업적 영향]
+
+  2003 년 NPTL 도입 후:
+    Apache, MySQL, Java 등의 thread 모델 효율 폭발
+    Linux 서버의 동시 connection 처리 능력 대폭 증가
+    Java JVM 의 NPTL 모드 도입
+    
+  현재:
+    모든 Linux 응용이 NPTL 위에서 동작
+    Docker, Kubernetes 의 thread 효율
+    Node.js, Go 의 thread 활용 (Go 의 goroutine 도 NPTL 위에)</code></pre>
+<h3 id="이-장의-결론">이 장의 결론</h3>
+<p>NPTL 정리:</p>
+<pre class="code-block lang-text"><code>[NPTL 정리]
+
+  ✓ 2003 년 도입 (Red Hat, Ulrich Drepper, Ingo Molnar)
+  ✓ LinuxThreads 의 모든 문제 해결
+  ✓ kernel 과의 협조:
+    - futex (uncontended fast path)
+    - CLONE_SETTLS, CLONE_CHILD_CLEARTID
+    - tgkill, gettid, exit_group
+    - set_robust_list
+  ✓ 1:1 user thread ↔ kernel task
+  ✓ struct pthread (TCB) 가 stack 위에
+  ✓ stack 캐싱으로 thread pool 효율적
+  ✓ libpthread.so → libc.so 통합 (2.34, 2021)
+  ✓ cond variable 새 알고리즘 (2.25, 2017)
+  ✓ 모든 현대 Linux 응용의 기반</code></pre>
+<p>마지막 장에서는 — pthread 의 모든 동기화의 _밑바닥_, <strong>futex</strong> 의 정체를 본다. user-space 와 kernel 의 영리한 협조.</p>
+<h2 class="section-heading" id="52-futex-동기화의-kernel-primitives"><span class="section-num">52</span><span class="section-title">futex — 동기화의 kernel primitives</span></h2>
+<p>Part VI 의 마지막 장. 지금까지 본 모든 동기화 primitive — mutex, cond variable, rwlock, semaphore — 의 _밑바닥_ 에 있는 것은 <strong>futex</strong> (Fast Userspace muTEX). 이 장은 — futex 의 정체와 그 디자인의 천재성.</p>
+<h3 id="futex-의-본질">futex 의 본질</h3>
+<pre class="code-block lang-text"><code>[futex 의 한 줄 정의]
+
+  &quot;user-space 에서 검사하고, 필요할 때만 kernel 로 가는 sleep/wakeup primitive&quot;
+  
+  핵심 idea:
+    user-space: atomic 변수로 빠른 결정
+    kernel: wait queue 만 관리
+    
+  결과:
+    uncontended case → 0 syscall (atomic 만)
+    contended case → 1 syscall (futex_wait/wake)</code></pre>
+<h3 id="futex-syscall-api"><code class="inline-code">futex</code> syscall API</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux syscall]</span>
+#include &lt;linux/futex.h&gt;
+#include &lt;sys/syscall.h&gt;
+
+<span class="hl-kw">long</span> <span class="hl-fn">syscall</span>(SYS_futex, <span class="hl-kw">uint32_t</span> *uaddr, <span class="hl-kw">int</span> futex_op, <span class="hl-kw">uint32_t</span> val,
+             <span class="hl-kw">const</span> <span class="hl-kw">struct</span> timespec *timeout, <span class="hl-kw">uint32_t</span> *uaddr2,
+             <span class="hl-kw">uint32_t</span> val3);</code></pre>
+<pre class="code-block lang-text"><code>[인자]
+
+  uaddr   : futex 의 user-space 주소 (32-bit aligned)
+  futex_op: 동작 (WAIT, WAKE, REQUEUE 등)
+  val     : 동작에 따른 값
+  timeout : WAIT 의 시간 제한
+  uaddr2, val3: 일부 동작의 추가 인자</code></pre>
+<h3 id="futex_wait-atomic-한-sleep"><code class="inline-code">FUTEX_WAIT</code> — atomic 한 sleep</h3>
+<p>가장 중요한 동작.</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 의사 코드]</span>
+<span class="hl-fn">FUTEX_WAIT</span>(addr, val, timeout):
+    atomic {
+        <span class="hl-kw">if</span> (*addr == val) {
+            sleep on <span class="hl-fn">addr</span> (until WAKE or timeout)
+        } <span class="hl-kw">else</span> {
+            <span class="hl-kw">return</span> EAGAIN
+        }
+    }</code></pre>
+<p>핵심 — **<code class="inline-code">*addr == val</code> 검사와 sleep 이 atomic**. race-free 의 마법.</p>
+<h3 id="futex_wake-sleep-깨움"><code class="inline-code">FUTEX_WAKE</code> — sleep 깨움</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 의사 코드]</span>
+<span class="hl-fn">FUTEX_WAKE</span>(addr, n):
+    <span class="hl-co">/* addr 에서 자고 있는 thread 중 _최대 n 개_ 깨움 */</span>
+    n == <span class="hl-num">1</span>: 한 명 <span class="hl-fn">깨움</span> (signal 같은 동작)
+    n == INT_MAX: 모두 <span class="hl-fn">깨움</span> (broadcast)</code></pre>
+<p>매우 단순한 인터페이스 — <code class="inline-code">WAIT</code> + <code class="inline-code">WAKE</code>. 이걸로 모든 동기화 가능.</p>
+<h3 id="가장-단순한-사용-예">가장 단순한 사용 예</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C 예제, mutex 구현]</span>
+#include &lt;linux/futex.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;stdatomic.h&gt;
+
+atomic_int futex = <span class="hl-num">0</span>;
+
+<span class="hl-kw">void</span> <span class="hl-fn">simple_lock</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-kw">while</span> (<span class="hl-num">1</span>) {
+        <span class="hl-kw">int</span> expected = <span class="hl-num">0</span>;
+        <span class="hl-kw">if</span> (<span class="hl-fn">atomic_compare_exchange_weak</span>(&amp;futex, &amp;expected, <span class="hl-num">1</span>))
+            <span class="hl-kw">return</span>;     <span class="hl-co">/* 성공 — lock 획득 */</span>
+        
+        <span class="hl-co">/* contended — futex 가 0 이 될 때까지 대기 */</span>
+        <span class="hl-fn">syscall</span>(SYS_futex, &amp;futex, FUTEX_WAIT, <span class="hl-num">1</span>, <span class="hl-kw">NULL</span>, <span class="hl-kw">NULL</span>, <span class="hl-num">0</span>);
+        <span class="hl-co">/* &quot;*futex == 1 이면 대기&quot; */</span>
+    }
+}
+
+<span class="hl-kw">void</span> <span class="hl-fn">simple_unlock</span>(<span class="hl-kw">void</span>) {
+    <span class="hl-fn">atomic_store</span>(&amp;futex, <span class="hl-num">0</span>);
+    <span class="hl-fn">syscall</span>(SYS_futex, &amp;futex, FUTEX_WAKE, <span class="hl-num">1</span>, <span class="hl-kw">NULL</span>, <span class="hl-kw">NULL</span>, <span class="hl-num">0</span>);
+    <span class="hl-co">/* 한 명 깨움 */</span>
+}</code></pre>
+<pre class="code-block lang-text"><code>[이 단순한 lock 의 동작]
+
+  uncontended lock:
+    CAS 0→1 성공 → 즉시 반환
+    syscall 0
+    
+  contended lock:
+    CAS 실패 → futex_wait(futex, 1)
+    kernel 에서 sleep
+    unlock 시 깨어남
+    다시 CAS 시도
+    
+  uncontended unlock:
+    store 0 → futex_wake
+    waiter 없으면 wake 는 0 반환 (no-op)
+    
+  ★ 실제 mutex 는 더 정교 (3 state: 0/1/2 로 wake 도 skip)</code></pre>
+<h3 id="futex-의-atomic-한-race-free-보장">futex 의 atomic 한 race-free 보장</h3>
+<p>매우 중요한 시나리오:</p>
+<pre class="code-block lang-text"><code>[lost wakeup 방지 시나리오]
+
+  thread A (lock holder):           thread B (waiter):
+  ─────────────────────────         ─────────────────────
+  현재: futex == 1                  CAS 0→1 실패
+  
+                                    futex_wait(addr, 1)
+                                    
+  store 0                           
+  futex_wake(addr, 1)               kernel: addr 의 값 == 1 ?
+                                            아님 (B 가 검사 직전 A 가 변경)
+                                    → EAGAIN 즉시 반환 (안 자고)
+                                    → CAS 다시 시도 → 성공
+  
+  → lost wakeup 없음 ★</code></pre>
+<p>이 atomic 검사가 — futex 의 핵심 정확성. kernel 안에서 — addr 의 값 확인 + sleep 이 atomic.</p>
+<h3 id="futex-의-kernel-구현-hash-table">futex 의 kernel 구현 — hash table</h3>
+<p>kernel 이 — 각 futex 주소 별 wait queue 를 어떻게 관리?</p>
+<pre class="code-block lang-text"><code>[kernel 의 futex 구현 — global hash table]
+
+  global hash table:
+    크기: 2^k 개 bucket (CPU 수 의존)
+    각 bucket: spinlock + linked list of waiters
+    
+  hash 키:
+    private futex: mm_struct + address
+    shared futex: inode + offset (페이지 단위)
+    
+  WAIT:
+    hash → bucket → lock bucket → insert waiter
+    
+  WAKE:
+    hash → bucket → lock bucket → find waiters</code></pre>
+<p>이 디자인이 — kernel 의 메모리 효율. _각 futex 마다 자료구조 만들지 않음_. 충돌 시 같은 bucket 에 — spinlock 으로 직렬화.</p>
+<h3 id="futex_private_flag-최적화"><code class="inline-code">FUTEX_PRIVATE_FLAG</code> — 최적화</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - C]</span>
+#define FUTEX_PRIVATE_FLAG  <span class="hl-num">0x80</span>
+#define <span class="hl-fn">FUTEX_WAIT_PRIVATE</span>  (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)</code></pre>
+<pre class="code-block lang-text"><code>[private futex 의 최적화]
+
+  process-private futex:
+    같은 process 안의 thread 만 사용
+    hash 키: mm_struct + address (간단)
+    → 빠름
+    
+  process-shared futex (default):
+    여러 process 간 (mmap MAP_SHARED)
+    hash 키: inode + offset (복잡)
+    → 약간 느림
+    
+  pthread_mutex 의 기본: PROCESS_PRIVATE → FUTEX_PRIVATE_FLAG
+  pthread_mutex 의 PROCESS_SHARED: 일반 futex</code></pre>
+<p>대부분의 동기화가 — private 으로 충분. private 의 효율.</p>
+<h3 id="futex-의-모든-operation">futex 의 모든 operation</h3>
+<pre class="code-block lang-text"><code>[futex operations]
+
+  FUTEX_WAIT:
+    atomic 검사 + sleep
+    
+  FUTEX_WAKE:
+    n 개 waiter 깨움
+    
+  FUTEX_REQUEUE:
+    한 futex 의 waiter 들을 다른 futex 로 _이동_
+    cond_broadcast 의 최적화
+    (thundering herd 방지)
+    
+  FUTEX_CMP_REQUEUE:
+    REQUEUE + 값 비교
+    
+  FUTEX_WAKE_OP:
+    WAKE + atomic 연산 (한 syscall 로)
+    
+  FUTEX_WAIT_BITSET / WAKE_BITSET:
+    bit 단위 매칭 (특정 bit set 인 waiter 만)
+    
+  FUTEX_LOCK_PI, FUTEX_UNLOCK_PI:
+    priority inheritance
+    real-time 응용
+    
+  FUTEX_TRYLOCK_PI:
+    PI mutex trylock
+    
+  FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI:
+    PI 의 cond variable 지원</code></pre>
+<p>매우 풍부한 API — 다양한 동기화 패턴 효율적 지원.</p>
+<h3 id="futex_requeue-broadcast-의-효율"><code class="inline-code">FUTEX_REQUEUE</code> — broadcast 의 효율</h3>
+<p><code class="inline-code">pthread_cond_broadcast</code> 의 단순한 구현:</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// 단순한 방법 (느림):</span>
+broadcast:
+    foreach waiter:
+        <span class="hl-fn">wake</span> (한 명씩)
+    <span class="hl-co">/* 모두 깨움 → 모두 mutex 잡으려 contention → thundering herd */</span></code></pre>
+<pre class="code-block lang-c"><code><span class="hl-co">// FUTEX_REQUEUE 사용 (효율):</span>
+broadcast:
+    wake 한 <span class="hl-fn">명</span> (cond futex 에서)
+    requeue 나머지 → mutex 의 wait queue 로
+    <span class="hl-co">/* 한 명만 진짜 깨움, 나머지는 mutex 잡으려 차례로 */</span></code></pre>
+<pre class="code-block lang-text"><code>[REQUEUE 의 효과]
+
+  옛 방식:
+    100 waiter 모두 깨움
+    모두 mutex 잡으려 시도 (99 명 실패)
+    99 번의 sleep → 다시 wakeup 사이클
+    
+  REQUEUE:
+    1 명만 깨움
+    99 명은 _이미_ mutex 의 wait queue 에
+    mutex unlock 시 1 명씩 깨움
+    
+  → 거대한 성능 차이 (특히 contention 많을 때)</code></pre>
+<h3 id="futex_wait_bitset-정교한-매칭"><code class="inline-code">FUTEX_WAIT_BITSET</code> — 정교한 매칭</h3>
+<pre class="code-block lang-c"><code><span class="hl-co">// 사용 예</span>
+<span class="hl-fn">syscall</span>(SYS_futex, addr, FUTEX_WAIT_BITSET, val, <span class="hl-kw">NULL</span>, <span class="hl-kw">NULL</span>, MASK);
+<span class="hl-fn">syscall</span>(SYS_futex, addr, FUTEX_WAKE_BITSET, n, <span class="hl-kw">NULL</span>, <span class="hl-kw">NULL</span>, MASK);
+<span class="hl-co">/* MASK 비트가 일치하는 waiter 만 깨움 */</span></code></pre>
+<pre class="code-block lang-text"><code>[BITSET 의 활용]
+
+  cond variable 의 새 알고리즘:
+    g1 / g2 group 표시에 사용
+    특정 generation 만 깨움
+    
+  rwlock:
+    read vs write 구분
+    
+  thread pool:
+    work item 종류별 wake</code></pre>
+<h3 id="futex_lock_pi-priority-inheritance"><code class="inline-code">FUTEX_LOCK_PI</code> — priority inheritance</h3>
+<p>real-time 응용의 매우 중요한 기능.</p>
+<pre class="code-block lang-text"><code>[FUTEX_LOCK_PI 의 메커니즘]
+
+  보통 futex_lock:
+    user-space 의 atomic + futex_wait
+    
+  FUTEX_LOCK_PI:
+    kernel 이 직접 lock 관리 (atomic 이 아닌 kernel level)
+    lock holder 의 우선순위를 waiter 의 수준으로 상승
+    
+  priority inheritance:
+    A (낮은 prio) 가 lock 잡음
+    B (높은 prio) 가 wait_pi
+    → kernel 이 A 의 prio 를 B 수준으로 상승
+    → C (중간 prio) 가 A 를 preempt 못 함
+    → A 빨리 끝남 → B 가 lock 획득</code></pre>
+<p>real-time 시스템 (산업 자동화, 화성 탐사선 등) 에서 필수.</p>
+<h3 id="futex-의-보안-race-condition-들">futex 의 보안 — race condition 들</h3>
+<p>futex 가 매우 복잡한 메커니즘이라 — 보안 이슈 여럿.</p>
+<pre class="code-block lang-text"><code>[유명한 futex CVE]
+
+  CVE-2014-3153 (Towelroot):
+    FUTEX_WAIT_REQUEUE_PI 의 race
+    → Android root 익스플로잇
+    → kernel 권한 상승
+    
+  CVE-2015-1593:
+    futex 의 stack pivoting
+    
+  CVE-2018-6927:
+    futex_requeue 의 정수 overflow
+    
+  → futex 가 복잡해서 보안 버그 자주
+  → kernel 의 가장 정교한 코드 중 하나</code></pre>
+<h3 id="futex2-차세대-futex-linux-5-16">futex2 — 차세대 futex (Linux 5.16+)</h3>
+<p>새 futex 인터페이스 (2022 부터):</p>
+<pre class="code-block lang-c"><code><span class="hl-co">// [user-space - Linux 5.16+]</span>
+<span class="hl-kw">long</span> <span class="hl-fn">futex_waitv</span>(<span class="hl-kw">struct</span> futex_waitv *waiters, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> nr_futexes,
+                 <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> flags, <span class="hl-kw">struct</span> __kernel_timespec *timeout,
+                 clockid_t clockid);
+
+<span class="hl-kw">long</span> <span class="hl-fn">futex_wake</span>(<span class="hl-kw">void</span> *uaddr, <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> mask, <span class="hl-kw">int</span> nr, <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> flags);
+<span class="hl-kw">long</span> <span class="hl-fn">futex_wait</span>(<span class="hl-kw">void</span> *uaddr, <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> val, <span class="hl-kw">unsigned</span> <span class="hl-kw">long</span> mask,
+                <span class="hl-kw">unsigned</span> <span class="hl-kw">int</span> flags, <span class="hl-kw">struct</span> __kernel_timespec *timeout,
+                clockid_t clockid);</code></pre>
+<pre class="code-block lang-text"><code>[futex2 의 새 기능]
+
+  ✓ 여러 futex 의 동시 wait (vector wait)
+     → &quot;이 중 어느 하나&quot; 의미
+     → cond variable 의 더 효율적 구현
+     
+  ✓ 64-bit value 지원 (옛 32-bit 만)
+  
+  ✓ NUMA-aware (실험)
+  
+  ✓ size 다양화 (8/16/32/64 bit)
+  
+  glibc 의 NPTL 도 — 점진적으로 futex2 채용 중</code></pre>
+<h3 id="futex-의-다른-응용">futex 의 다른 응용</h3>
+<p>futex 가 — pthread 외에도 다양하게 활용.</p>
+<pre class="code-block lang-text"><code>[futex 의 응용]
+
+  glibc:
+    pthread_mutex
+    pthread_cond
+    pthread_rwlock
+    pthread_barrier
+    pthread_once
+    sem_t
+    pthread_join (CLONE_CHILD_CLEARTID)
+    file lock (옛, deprecated)
+    
+  응용 코드:
+    custom lock-free 자료구조의 wakeup
+    이벤트 신호 (eventfd 대안)
+    
+  언어 런타임:
+    Go 의 일부 runtime (mutex)
+    Rust 의 std::sync (parking_lot)
+    Java JVM (futex 사용)
+    Python (일부)</code></pre>
+<h3 id="futex-의-성능-측정">futex 의 성능 측정</h3>
+<pre class="code-block lang-text"><code>[futex 성능 (대략)]
+
+  uncontended (atomic 만):
+    ~5 ns (한 atomic CAS)
+    
+  futex_wait (sleep):
+    syscall 자체: ~100 ns
+    + context switch: ~1 μs
+    + wakeup latency: 가변
+    
+  futex_wake (waiter 없음):
+    syscall: ~100 ns
+    no-op 같음
+    
+  futex_wake (waiter 있음):
+    syscall + scheduler wake: ~수 μs</code></pre>
+<p>이 매우 빠른 fast path 가 — pthread 의 모든 효율의 비밀.</p>
+<h3 id="futex-디자인의-천재성">futex 디자인의 천재성</h3>
+<p>futex 가 진정 천재적인 이유:</p>
+<pre class="code-block lang-text"><code>[futex 의 디자인 미덕]
+
+  1. user-kernel split 의 영리함:
+     자주 일어나는 case (uncontended) 는 user
+     드문 case (contention) 만 kernel
+     
+  2. atomic 검사의 정확성:
+     race-free 보장 (lost wakeup 없음)
+     
+  3. 메모리 효율:
+     futex 자체는 4 byte (32-bit int)
+     kernel 의 자료구조는 hash table (공유)
+     → 백만 개 futex 도 효율적
+     
+  4. 단순한 인터페이스:
+     WAIT, WAKE 만으로 모든 동기화 표현
+     mutex, cond var, sem, rwlock, barrier 모두 구현 가능
+     
+  5. 확장성:
+     REQUEUE, BITSET, PI 등 점진적 추가
+     모든 케이스에 맞는 변종</code></pre>
+<p>이게 — Hubertus Franke, Rusty Russell, Matthew Kirkwood (2002) 의 영리한 디자인. 이후 모든 OS 가 비슷한 메커니즘 채용 (Windows 의 WaitOnAddress, macOS 의 ulock 등).</p>
+<h3 id="linux-외-os-의-비슷한-메커니즘">Linux 외 OS 의 비슷한 메커니즘</h3>
+<pre class="code-block lang-text"><code>[다른 OS 의 futex 등가물]
+
+  Windows (Windows 8+):
+    WaitOnAddress
+    WakeByAddressSingle / WakeByAddressAll
+    futex 와 거의 같은 API
+    
+  macOS / iOS:
+    ulock (internal)
+    os_unfair_lock 의 기반
+    
+  FreeBSD:
+    _umtx_op
+    
+  Solaris (옛):
+    lwp_park / lwp_unpark
+    
+  → 모두 같은 디자인 원칙</code></pre>
+<h3 id="part-vi-의-마무리">Part VI 의 마무리</h3>
+<p>이 장으로 — Part VI (pthread 의 깊이) 가 마무리.</p>
+<pre class="code-block lang-text"><code>[Part VI 마무리 — pthread 의 모든 것]
+
+  ✓ 43장: pthread 의 정체 — kernel thread 와의 관계
+  ✓ 44장: pthread_create / pthread_join
+  ✓ 45장: mutex — 가장 기본의 lock
+  ✓ 46장: condition variable — wait/signal 메커니즘
+  ✓ 47장: read-write lock, spinlock, barrier
+  ✓ 48장: semaphore — counting 동기화
+  ✓ 49장: TLS — Thread-Local Storage
+  ✓ 50장: cancellation 의 위험성
+  ✓ 51장: NPTL — glibc 의 thread 구현
+  ✓ 52장: futex — 동기화의 kernel primitives</code></pre>
+<p><code class="inline-code">pthread_create</code> 한 줄, <code class="inline-code">pthread_mutex_lock</code> 한 줄 — 이제 그 안의 모든 메커니즘이 보인다.</p>
+<pre class="code-block lang-text"><code>[pthread_mutex_lock(&amp;mutex) 한 줄의 깊이]
+
+  user-space:
+    atomic CAS: __lock (0 → 1)
+       │
+       ├─ 성공 → 즉시 반환 (~20 ns, syscall 없음) ★ fast path
+       │
+       └─ 실패 (contention)
+              │
+              ▼
+    user-space: __lock 을 2 로 표시
+              │
+              ▼
+    kernel:
+      futex(SYS_futex, &amp;__lock, FUTEX_WAIT, 2, NULL, NULL, 0)
+              │
+              ▼
+      kernel 의 hash table:
+        hash(mm + addr) → bucket
+        bucket lock
+        atomic check: *addr == 2 ?
+          아님 → EAGAIN 반환 (다시 시도)
+          맞음 → wait queue 에 추가
+                  → schedule_out (sleep)
+              │
+              ▼
+      다른 thread 의 unlock:
+        atomic_exchange: 0 → __lock
+        이전 값 2 → futex_wake
+              │
+              ▼
+      kernel:
+        hash → bucket → waiter 찾기 → wake_up_q
+        스케줄러가 우리 깨움
+              │
+              ▼
+    user-space: 다시 atomic CAS 시도
+                성공하면 lock 획득</code></pre>
+<p>이 모든 게 — pthread_mutex_lock 한 줄.</p>
+<p>이제 — thread 의 동작이 완전히 보인다. user-space 의 atomic 부터, futex 의 race-free 보장, kernel 의 hash table, scheduler 의 wakeup 까지.</p>
+<p>이 지식이 — multi-threaded 응용의 디버깅, 성능 최적화, 디자인 결정에 직접 도움. 왜 spinlock 이 짧은 critical section 만, 왜 cond variable 이 while loop 필수, 왜 cancellation 안 쓰는지 — 모두 자연스럽게 보임.</p>
+<p>Part VII 부터는 — <strong>dynamic linker (ld-linux.so)</strong> 의 더 깊은 부분으로. Part III 에서 본 _start 의 뒤를 잇는, library loading, lazy binding, symbol resolution 의 모든 것.</p>
+<hr>
+<nav class="part-nav part-nav-bottom"><a href="part5.html" class="nav-link nav-prev" rel="prev"><span class="nav-arrow">←</span><span class="nav-meta"><span class="nav-label">Part V</span><span class="nav-title">stdio 의 깊이</span></span></a><a href="index.html" class="nav-hub">libc 허브</a><a href="part7.html" class="nav-link nav-next" rel="next"><span class="nav-meta nav-meta-right"><span class="nav-label">Part VII</span><span class="nav-title">dynamic linker</span></span><span class="nav-arrow">→</span></a></nav>
+</main>
+</div>
+<script src="../assets/script.js"></script>
+</body>
+</html>
